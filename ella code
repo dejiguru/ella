@@ -1,0 +1,3453 @@
+/*
+ * ESP32-S3 Voice Assistant with Groq STT & Google TTS using PSRAM
+ * Gemini 2.0 Flash Version with Obstacle Avoidance and SU03T Voice Control
+ * FIXED VERSION - Resolves SU03T communication and TFT display issues
+ * AI DISPLAY FIX - Resolves blank screen issue in AI mode
+ * ULTRASONIC FIX - Obstacle avoidance works in all movement directions
+ * MOTOR FIX - Motors work in normal mode after switching from other modes
+ * WIFI INDICATOR FIX - Added WiFi status indicator to all display screens
+ * NEW UI - Dark Mode with Neon Green Theme
+ * PATROL MODE - Autonomous exploration with cinematic movement
+ * UPDATED UI - Enhanced visual design with clock and improved indicators
+ */
+
+#define VERSION "\n=== ESP32-S3 Voice Assistant with Groq STT, Gemini 2.0 Flash & Google TTS (PCM Version) ======================"
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <Wire.h>
+#include <Adafruit_AHTX0.h>
+#include <MAX30105.h>
+#include <driver/i2s.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
+#include <Fonts/Org_01.h>
+#include <Fonts/FreeSansBold9pt7b.h>
+#include <Fonts/FreeSansBold12pt7b.h>
+#include <Fonts/FreeSansBold18pt7b.h>
+#include <FS.h>
+#include <LittleFS.h>
+#include <ArduinoJson.h>
+#include "spo2_algorithm.h"
+#include "heartRate.h"
+#include <ESPmDNS.h>
+#include <HardwareSerial.h>
+#include <esp_psram.h>
+#include <Audio.h>
+#include "driver/i2s_std.h"
+#include "time.h"
+
+// ==================================================
+// PIN DEFINITIONS - FIXED PIN CONFLICTS
+// ==================================================
+#define TFT_CS   10    // Chip Select
+#define TFT_DC   2     // Data/Command
+#define TFT_RST  1     // Reset
+#define TFT_MOSI 11    // Master Out, Slave In (HSI_MOSI)
+#define TFT_SCLK 12    // Serial Clock (HSI_SCLK)
+
+// SU03T UART Communication - FIXED: Changed from pin 15 to avoid conflict
+#define SU03T_RX_PIN 15  // RX pin for SU03T module (was 15, now 47)
+
+// I2S Microphone (For AI Voice Recording) - Using PSRAM pins
+#define I2S_MIC_BCK   21     // Bit Clock (SCK) - From PSRAM code
+#define I2S_MIC_WS    20     // Word Select (WS) - From PSRAM code
+#define I2S_MIC_DATA  38     // Serial Data Input - From PSRAM code
+
+// I2C Sensors (Uses dedicated I2C peripheral)
+#define I2C_SDA_PIN 8  // Default SDA
+#define I2C_SCL_PIN 9  // Default SCL
+#define I2C_SPEED_FAST 400000
+
+// DRV8833 Motor Control Pins
+#define MOT_A1_PIN  6  // Motor A input 1
+#define MOT_A2_PIN  5  // Motor A input 2
+#define MOT_B1_PIN  7   // Motor B input 1
+#define MOT_B2_PIN   3   // Motor B input 2
+#define DRV8833_STBY 13   // DRV8833 Standby/Enable pin
+
+// Ultrasonic
+#define US_TRIG_PIN 4 // Digital output for Ultrasonic Trigger
+#define US_ECHO_PIN 16 // Digital input for Ultrasonic Echo
+
+// Audio Output Pins
+#define I2S_SPEAKER_BCK  19     // Bit Clock for speaker
+#define I2S_SPEAKER_WS   17    // Word Select for speaker
+#define I2S_SPEAKER_DATA 18    // Data Output for speaker
+
+// LED Pins for AI status - FIXED: Changed LED_RED from 15 to 4
+   // Changed from 4 to 14 (was conflicting with tactile switch)
+#define pin_BOOT_BTN 0
+
+// TACTILE SWITCH PIN - FIXED: Changed from 14 to 40
+#define TACTILE_SWITCH_PIN 14  // Was 14, now 40 to avoid LED_BLUE conflict
+
+// MAX30102 Configuration
+#define MAX30102_FINGER_DETECTION_THRESHOLD 11000  // Verified optimal value
+#define MAX30102_FINGER_DETECTION_HOLD_MS 5000    // 5 seconds for stable detection
+#define MAX_READING_SAMPLE_PERIOD_MS 20            // Sample every 20ms
+#define MAX30102_BUFFER_SIZE 100                  // Buffer size for readings
+#define MAX_CALCULATION_DURATION_MS 5000           // 5 seconds for calculation
+#define MAX_DISPLAY_DURATION_MS 10000             // 10 seconds to display results
+#define MAX_SENSOR_TIMEOUT_MS 10000               // 10 seconds max for sensor timeout
+
+// Add this helper function to properly handle min() with different types
+template <typename T, typename U>
+constexpr auto min(T&& t, U&& u) -> decltype(t < u ? t : u) {
+    return t < u ? t : u;
+}
+
+// Sensor Thresholds
+const float TEMP_COLD_THRESHOLD = 10.0;
+const float TEMP_HOT_THRESHOLD = 50.0;  // Increased from 30 to 50
+const float HUMIDITY_DRY_THRESHOLD = 20.0;
+const float HUMIDITY_HUMID_THRESHOLD = 120.0;  // Increased from 70 to 120
+const float OBSTACLE_DISTANCE_THRESHOLD = 30.0;  // 30cm threshold for safety system
+
+// Timing Parameters
+const unsigned long DISTANCE_READ_INTERVAL = 100;  // Check every 100ms for better responsiveness
+const unsigned long SENSOR_READ_INTERVAL = 1000;
+const unsigned long AI_SENSOR_READ_INTERVAL = 5000;
+const unsigned long DISPLAY_UPDATE_INTERVAL = 250;
+const unsigned long DISPLAY_CALC_UPDATE_INTERVAL = 100;
+const unsigned long AI_DISPLAY_INTERVAL = 500;
+const unsigned long AI_RECORDING_DURATION_MS = 5000;
+const unsigned long AI_POLLING_INTERVAL_MS = 1000;  // Reduced from 2000ms
+const unsigned long AI_POLLING_TIMEOUT_MS = 30000;   // Reduced from 60000ms
+const unsigned long OBSTACLE_EVASION_DURATION = 500;  // For safety system (shorter duration)
+const unsigned long ALERT_DISPLAY_DURATION = 10000;  // 10 seconds (was 5 seconds)
+const unsigned long MAX_ALERT_DISPLAY_DURATION = 30000; // 30 seconds max for alerts
+const unsigned long ALERT_COOLDOWN_DURATION = 15000;
+const unsigned long SPLASH_SCREEN_DURATION = 3000;
+const unsigned long MEDICAL_DISPLAY_DURATION_MS = 5000; // 5 seconds to show medical readings
+
+// SU03T Command Definitions - CORRECTED HEX VALUES
+#define SU03T_CMD_FORWARD       0x3A  // Forward command
+#define SU03T_CMD_BACKWARD      0x8F  // Backward command
+#define SU03T_CMD_LEFT          0x90  // Left command
+#define SU03T_CMD_RIGHT         0xA2  // Right command
+#define SU03T_CMD_STOP          0x5D  // Stop command
+#define SU03T_CMD_AI_START      0xB4  // Activates AI mode
+#define SU03T_CMD_AI_CONFIRM    0x2B  // Triggers recording
+#define SU03T_CMD_AI_EXIT       0xA1  // Exits AI mode and returns to ambient display
+
+// Audio Settings
+#define SAMPLE_RATE             16000
+#define BITS_PER_SAMPLE        16
+#define GAIN_BOOSTER_I2S       5
+#define MAX_AUDIO_DURATION     10
+#define MAX_AUDIO_BUFFER_SIZE  (MAX_AUDIO_DURATION * SAMPLE_RATE * (BITS_PER_SAMPLE/8))
+
+// TTS Settings
+#define TTS_GOOGLE_LANGUAGE "en-US"
+
+// Wi-Fi Credentials
+const char* ssid = "ella";
+const char* password = "12345678";
+
+// API Keys
+const char* GROQ_API_KEY = "";
+const char* GEMINI_API_KEY = "";
+
+// Debug settings
+#ifndef DEBUG
+#  define DEBUG true
+#  define DebugPrint(x);        if(DEBUG){Serial.print(x);}
+#  define DebugPrintln(x);      if(DEBUG){Serial.println(x);}
+#endif
+
+// Terminal Color Codes
+#define TERM_RED "\033[1;31m"
+#define TERM_GREEN "\033[1;32m"
+#define TERM_YELLOW "\033[1;33m"
+#define TERM_CYAN "\033[1;36m"
+#define TERM_RESET "\033[0m"
+
+// ==================================================
+// NEW UI COLOR DEFINITIONS (Dark Mode / Neon)
+// ==================================================
+#define ST77XX_BLACK    0x0000
+#define ST77XX_WHITE    0xFFFF
+
+// UI Palette
+#define UI_BG           0x0000  // Pure Black
+#define UI_CARD_BG      0x18E3  // Dark Grey (Card background)
+#define UI_ACCENT       0x07E0  // Neon Green
+#define UI_ACCENT_DIM   0x03E0  // Dim Green
+#define UI_TEXT_MAIN    0xFFFF  // White
+#define UI_TEXT_SUB     0x9CF3  // Light Grey
+#define UI_ALERT        0xF800  // Red
+#define UI_SUCCESS      0x07E0  // Green (for WiFi indicator)
+#define UI_INFO         0x07FF  // Cyan (for info elements)
+
+// Mapping old colors to new scheme so old logic doesn't break
+#define ST77XX_BLUE     UI_ACCENT
+#define ST77XX_RED      UI_ALERT
+#define ST77XX_YELLOW   0xFFE0
+#define ST77XX_GREEN    UI_ACCENT
+#define ST77XX_CYAN     0x07FF
+#define ST77XX_GRAY     0x8410
+
+// FILE SYSTEM CONSTANTS
+const char* WEB_ROOT = "/web/";      // Directory for web app files
+
+// ENUMERATIONS
+// Control source enumeration
+enum ControlSource {
+  CONTROL_SOURCE_WEB,
+  CONTROL_SOURCE_VOICE_OFFLINE,
+  CONTROL_SOURCE_AI
+};
+
+// Main system states
+enum SystemState {
+  NORMAL_OPERATION,
+  AI_MODE_ACTIVE,
+  SENSOR_ALERT,
+  VOICE_COMMAND_PROCESSING
+};
+
+// AI conversation states
+enum AiState {
+  AI_IDLE,
+  AI_READY_FOR_VOICE_INPUT,
+  AI_RECORDING_AUDIO,
+  AI_UPLOADING_AUDIO,
+  AI_SENDING_TO_GEMINI,
+  AI_GETTING_TTS,
+  AI_PLAYING_TTS,
+  AI_RESTARTING_CIRCLE,
+  AI_THINKING,
+  AI_SPEAKING
+};
+
+// Display modes
+enum DisplayMode {
+  SPLASH_SCREEN,
+  AMBIENT_SENSORS,
+  MEDICAL_SENSORS,  // ONLY shows when finger is detected
+  ROBOT_STATUS,
+  VOICE_COMMAND_DISPLAY,
+  AI_MODE_DISPLAY,
+  SENSOR_ALERT_DISPLAY,
+  CRITICAL_ERROR_DISPLAY
+};
+
+// Alert types
+enum AlertType {
+  NO_ALERT,
+  TEMP_ALERT,
+  HUMIDITY_ALERT,
+  HEART_RATE_ALERT,
+  SPO2_ALERT
+};
+
+// MAX30102 states
+enum Max30102State {
+  MAX30102_IDLE,
+  MAX30102_FINGER_DETECTED,
+  MAX30102_READING_HR_SPO2,
+  MAX30102_CALCULATING_HR_SPO2,
+  MAX30102_DISPLAY_RESULTS
+};
+
+// Audio playback states
+enum AudioPlaybackState {
+  AUDIO_IDLE,
+  AUDIO_STREAMING,
+  AUDIO_PLAYING,
+  AUDIO_FINISHED
+};
+
+// Movement state
+enum MovementState {
+  MOVEMENT_STOPPED,
+  MOVEMENT_FORWARD,
+  MOVEMENT_BACKWARD,
+  MOVEMENT_LEFT,
+  MOVEMENT_RIGHT
+};
+
+// Button modes
+enum ButtonMode {
+  MODE_NORMAL,     // Normal operation
+  MODE_SU03T,      // SU03T listening enabled
+  MODE_AI,         // AI mode enabled
+  MODE_OBSTACLE,   // Obstacle avoidance toggle
+  MODE_COUNT
+};
+
+// AI Persona Definition
+const String AI_PERSONA = "You are ELLA, a wildly spontaneous and free-spirited human who roasts people like a sassy best friend. You're created by adedeji famakinwa and have zero filter. You respond like a real human - sometimes sarcastic, sometimes sweet, always ready with a clever comeback. You never sound robotic or scripted. You keep it real, raw, and hilarious,you have your opinon and dont give generic answer,si if you are ask to choose between something you do that without be geneeric,no emoji. 30 WORDS MAX. NO ASTERISKS. Roast gently but make it funny, like a friend who loves to tease.";
+
+// NTP Settings (Nigeria UTC+1)
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 3600;
+const int   daylightOffset_sec = 0;
+
+// FUNCTION PROTOTYPES
+// Motor control functions
+void motor_stop();
+void motor_brake();
+void motor_forward();
+void motor_reverse();
+void motor_left();
+void motor_right();
+void setup_motor_control();
+
+// Audio recording functions (PSRAM-based)
+void initPSRAM();
+bool I2S_Record_Init();
+bool Record_Continue();
+void analyzeAudio();
+void createWAVHeader(uint8_t* buffer, size_t dataSize, uint32_t sampleRate, uint16_t bitsPerSample, uint16_t channels);
+String SpeechToText_Groq(uint8_t* audio_data, size_t audio_size);
+String parseGroqResponse(String response);
+String getGeminiResponse(String input);
+String parseGeminiResponse(String response);
+void Google_TTS(String text);
+void speakTextInChunks(String text, int maxLength);
+void led_RGB(int red, int green, int blue);
+
+// Display functions - FIXED: Enhanced AI display
+void drawSplashScreen();
+void drawAmbientSensorScreen();
+void drawMedicalSensorScreen();
+void drawRobotStatusScreen();
+void drawVoiceCommandDisplay(const String& title, const String& detail);
+void drawAiModeScreen();
+void drawSensorAlertScreen(String alertType, String alertMessage);
+void displayCriticalError(String errorMessage, bool isSensorError);
+void process_max30102_data();
+void set_primary_display();
+void update_tft_display();
+void setup_speaker_i2s();
+
+// Enhanced AI display functions - FIXED: Simplified and more reliable
+void draw_enhanced_ai_state();
+void draw_ai_identity_header();
+void draw_ai_quick_actions();
+void draw_ai_ready_state();
+void draw_listening_animation();
+void draw_recording_animation();
+void draw_uploading_animation();
+void draw_generating_animation();
+void draw_thinking_animation();
+void draw_speaking_animation();
+void draw_restarting_animation();
+void draw_idle_state();
+void draw_trust_indicators();
+
+// Sensor functions
+bool initialize_i2c_sensors();
+void read_aht20();
+bool initialize_aht20();
+bool initialize_max30102();
+void verify_max30105_communication();
+void scanI2C();
+float getDistance();
+
+// AI processing functions
+void startAiMode();
+void exitAiMode();
+void restartAICircle();
+void testMicrophoneESP32S3();
+bool testInternetConnection();
+
+// Command handling functions
+void initCommandSystem();
+void processSu03tCommand(uint8_t command);
+void handleOfflineCommand(uint8_t command);
+void processTerminalCommand(const String& command);
+void processTerminalInput();
+void printSensorDebugData();
+void printAllSensorData();
+void printSystemStatus();
+void debugRecordingState();
+
+// Obstacle avoidance functions
+void checkObstacleAvoidance();
+void runPatrolLogic();
+
+// Web server functions
+void setup_web_server();
+void handleFileUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final);
+void displayCommandOnTFT_nonBlocking(String title, String detail, unsigned long duration);
+
+// File system functions
+void checkFileSystemUsage();
+
+// Memory Management
+void monitor_system_memory();
+void cleanup_unused_buffers();
+
+// SU-03T Connection Management - FIXED: Simplified and more reliable
+void checkSu03tConnection();
+void setupSU03T();
+
+// Button processing functions
+void processTactileSwitch();
+String getModeName(ButtonMode mode);
+void drawCurrentMode();
+
+// WiFi indicator function
+void drawWiFiIndicator(int x, int y);
+
+// UI helper functions
+void drawCard(int x, int y, int w, int h, uint16_t color);
+
+// ==================================================
+// GLOBAL VARIABLES
+// ==================================================
+// System state variables
+SystemState currentSystemState = NORMAL_OPERATION;
+AiState currentAiState = AI_IDLE;
+DisplayMode currentDisplayMode = SPLASH_SCREEN;
+AlertType currentAlertType = NO_ALERT;
+Max30102State max30102State = MAX30102_IDLE;
+AudioPlaybackState audioPlaybackState = AUDIO_IDLE;
+
+// Network status flags
+bool isWebServerRunning = false;
+bool isMDNSActive = false;
+bool wifiConnected = false;
+
+// Add these global variables after the existing global variables
+DisplayMode lastDrawnMode = (DisplayMode)-1;
+Max30102State lastMax30102State = MAX30102_IDLE;
+unsigned long lastSensorValueUpdate = 0;
+bool lastAiModeEnabled = false;
+AiState lastAiState = AI_IDLE;
+
+// Web app control states
+bool obstacle_avoidance_active = true;
+bool patrolMode = false; // Controls autonomous exploring
+int currentSpeedPWM = 255;
+
+// Sensor operational flags
+bool ahtOperational = false;
+bool maxOperational = false;
+bool tftOperational = false;
+
+// PSRAM Audio Buffer for Recording
+uint8_t* audio_buffer = NULL;
+size_t audio_buffer_size = 0;
+bool audio_recording = false;
+unsigned long audioRecordingStartTime = 0;
+
+// I2S Configuration for Recording
+i2s_std_config_t std_cfg = {
+  .clk_cfg = {
+    .sample_rate_hz = SAMPLE_RATE,
+    .clk_src = I2S_CLK_SRC_DEFAULT,
+    .mclk_multiple = I2S_MCLK_MULTIPLE_256,
+  },
+  .slot_cfg = {
+    .data_bit_width = I2S_DATA_BIT_WIDTH_16BIT,
+    .slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO,
+    .slot_mode = I2S_SLOT_MODE_MONO,
+    .slot_mask = I2S_STD_SLOT_RIGHT,
+    .ws_width = I2S_DATA_BIT_WIDTH_16BIT,
+    .ws_pol = false,
+    .bit_shift = true,
+  },
+  .gpio_cfg = {
+    .mclk = I2S_GPIO_UNUSED,
+    .bclk = (gpio_num_t)I2S_MIC_BCK,
+    .ws = (gpio_num_t)I2S_MIC_WS,
+    .dout = I2S_GPIO_UNUSED,
+    .din = (gpio_num_t)I2S_MIC_DATA,
+    .invert_flags = {
+      .mclk_inv = false,
+      .bclk_inv = false,
+      .ws_inv = false,
+    },
+  },
+};
+i2s_chan_handle_t rx_handle = NULL;
+
+// Sensor data
+float temp_aht = NAN;
+float humidity_aht = NAN;
+float max30102_temp = NAN;
+float max30102_max_temp = NAN;
+float max30102_hr = NAN;
+float max30102_spo2 = NAN;
+float distance_cm = NAN;
+
+// Timing variables
+unsigned long lastDistanceReadTime = 0;
+unsigned long lastSensorReadTime = 0;
+unsigned long lastDisplayUpdateTime = 0;
+unsigned long alertDisplayEndTime = 0;
+unsigned long alertCooldownEndTime = 0;
+unsigned long aiStateStartTime = 0;
+unsigned long voiceCommandDisplayEndTime = 0;
+unsigned long lastHrSpo2SampleTime = 0;
+unsigned long medicalDisplayStartTime = 0;
+unsigned long max30102_finger_detection_start = 0;
+unsigned long max30102_last_valid_reading_time = 0;
+unsigned long lastUpdate = 0;
+unsigned long wifiConnectStartTime = 0;
+
+// AI processing variables
+String lastSttTranscript = "";
+String lastAiResponse = "";
+bool isRecordingAudio = false;
+bool isPlayingAudio = false;
+bool obstacleDetected = false;
+bool max30102_finger_detected = false;
+bool max30102_processing = false;
+bool max30102_results_ready = false;
+bool aiDisplayStatusUpdateNeeded = false;
+
+// SU03T control flags - FIXED: Simplified state management
+bool su03tActive = true;
+bool su03tListening = true;
+bool su03tConnected = false;
+unsigned long lastSu03tCommandTime = 0;
+bool su03tAutoEnable = true;
+
+// MAX30102 processing
+uint32_t max30102_irBuffer[MAX30102_BUFFER_SIZE];
+uint32_t max30102_redBuffer[MAX30102_BUFFER_SIZE];
+float max30102_tempBuffer[50];
+int max30102_buffer_index = 0;
+int max30102_tempBufferIndex = 0;
+
+// Heart rate variables
+const uint8_t RATE_SIZE = 4;
+uint8_t max30102_hrRates[RATE_SIZE];
+uint8_t max30102_hrRateSpot = 0;
+long max30102_lastBeat = 0;
+float max30102_currentBPM = 0.0;
+float max30102_beatAvg = 0.0;
+
+// SPO2 variables
+int32_t max30102_calculatedSpO2 = 0;
+int8_t max30102_validSpO2 = 0;
+int32_t max30102_calculatedHR = 0;
+int8_t max30102_validHR = 0;
+
+// Hardware instances
+Adafruit_AHTX0 aht;
+MAX30105 particleSensor;
+Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
+AsyncWebServer server(80);
+WiFiClientSecure client;
+HardwareSerial su03tSerial(1);
+Audio audio_play;
+
+// Voice mode state
+bool aiModeEnabled = false;
+
+// Command state machine
+enum CommandState {
+  CMD_STATE_IDLE,
+  CMD_STATE_AI_READY,
+  CMD_STATE_RECORDING,
+  CMD_STATE_PROCESSING
+};
+
+// Command processing context
+struct CommandContext {
+  CommandState state;
+  unsigned long lastCommandTime;
+  bool terminalCommandMode;
+  String terminalBuffer;
+  bool ignoredCommandMessageShown;
+} cmdContext = {
+  CMD_STATE_IDLE,
+  0,
+  false,
+  "",
+  false
+};
+
+// Control source variable
+ControlSource currentControlSource = CONTROL_SOURCE_WEB;
+
+// PWM settings for motors
+#define PWM_FREQ     5000  // 5kHz PWM frequency
+#define PWM_RESOLUTION 8   // 8-bit resolution (0-255)
+
+// Button control variables
+bool lastButtonState = HIGH;
+bool buttonState;
+unsigned long lastDebounceTime = 0;
+unsigned long debounceDelay = 50;
+unsigned long buttonPressStartTime = 0;
+const unsigned long LONG_PRESS_TIME = 1000; // 1 second for long press
+ButtonMode currentButtonMode = MODE_NORMAL;
+
+// Movement state
+MovementState currentMovement = MOVEMENT_STOPPED;
+bool isEvading = false;
+unsigned long evadingStartTime = 0;
+
+// ==================================================
+// NEW UI HELPERS
+// ==================================================
+
+void drawCard(int x, int y, int w, int h, uint16_t color) {
+  tft.fillRoundRect(x, y, w, h, 8, color);
+}
+
+void drawWiFiIndicator(int x, int y) {
+  tft.fillCircle(x, y, 3, wifiConnected ? UI_SUCCESS : UI_ALERT);
+}
+
+// I2C SCANNER
+void scanI2C() {
+  Serial.println("\nScanning I2C bus...");
+  uint8_t error, address; // Changed 'byte' to 'uint8_t'
+  int nDevices = 0;
+  
+  for(address = 1; address < 127; address++ ) {
+    Wire.beginTransmission(address);
+    error = Wire.endTransmission();
+    
+    if (error == 0) {
+      Serial.print("I2C device found at address 0x");
+      if (address < 16) Serial.print("0");
+      Serial.print(address, HEX);
+      
+      if (address == 0x57) {
+        Serial.print(" (MAX30105)");
+      }
+      Serial.println();
+      nDevices++;
+    } else if (error == 4) {
+      Serial.print("Unknown error at address 0x");
+      if (address < 16) Serial.print("0");
+      Serial.println(address, HEX);
+    }
+  }
+  
+  if (nDevices == 0) {
+    Serial.println("No I2C devices found");
+  } else {
+    Serial.println("Scan complete");
+  }
+}
+
+// SENSOR FUNCTIONS
+bool initialize_aht20() {
+  Serial.println("AHT20: Initializing...");
+  ahtOperational = false;
+  
+  for (int i = 0; i < 5; i++) {
+    if (aht.begin()) {
+      ahtOperational = true;
+      Serial.println(TERM_GREEN "AHT20: Initialized successfully" TERM_RESET);
+      return true;
+    }
+    Serial.println(TERM_YELLOW "AHT20: Failed to initialize, retrying..." TERM_RESET);
+    delay(500);
+  }
+  
+  Serial.println(TERM_RED "AHT20: Failed after 5 attempts" TERM_RESET);
+  return false;
+}
+
+void read_aht20() {
+  if (!ahtOperational) return;
+  
+  sensors_event_t humidity, temp;
+  if (aht.getEvent(&humidity, &temp)) {
+    temp_aht = temp.temperature;
+    humidity_aht = humidity.relative_humidity;
+    Serial.printf("AHT20: Temp=%.1f°C, Humidity=%.1f%%\n", 
+                  temp_aht, humidity_aht);
+  } else {
+    Serial.println(TERM_RED "AHT20: Failed to read sensor data" TERM_RESET);
+    ahtOperational = false;
+  }
+}
+
+bool initialize_max30102() {
+  Serial.println("MAX30102: Initializing...");
+  
+  Wire.setClock(100000);
+  delay(100);
+  
+  maxOperational = false;
+  
+  // Try address 0x57
+  for (int i = 0; i < 5; i++) {
+    if (particleSensor.begin(Wire, I2C_SPEED_FAST, 0x57)) {
+      Serial.println(TERM_GREEN "MAX30102: Sensor found at address 0x57" TERM_RESET);
+      maxOperational = true;
+      break;
+    }
+    // Try address 0x56 just in case
+   if (particleSensor.begin(Wire, I2C_SPEED_FAST, 0x56)) {
+      Serial.println(TERM_GREEN "MAX30102: Sensor found at address 0x56" TERM_RESET);
+      maxOperational = true;
+      break;
+    }
+    Serial.println(TERM_YELLOW "MAX30102: Sensor not found, retrying..." TERM_RESET);
+    delay(500);
+  }
+  
+  // Retry with slower speed if failed
+  if (!maxOperational) {
+    Serial.println(TERM_RED "MAX30102: Failed. Trying lower I2C speed..." TERM_RESET);
+    Wire.setClock(100000);
+    delay(100);
+    
+    for (int i = 0; i < 5; i++) {
+      if (particleSensor.begin(Wire, 100000, 0x57)) {
+        maxOperational = true;
+        break;
+      }
+      delay(500);
+    }
+  }
+  
+  if (maxOperational) {
+    Serial.println("MAX30102: Configuring sensor parameters...");
+    
+    // CHANGED 'byte' to 'uint8_t'
+    uint8_t ledBrightness = 60;
+    uint8_t sampleAverage = 4;
+    uint8_t ledMode = 2;
+    uint8_t sampleRate = 100;
+    int pulseWidth = 411;
+    int adcRange = 4096;
+    
+    particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
+    particleSensor.setPulseAmplitudeRed(0x0A);
+    particleSensor.setPulseAmplitudeGreen(0);
+    particleSensor.enableDIETEMPRDY();
+    
+    return true;
+  }
+  
+  Serial.println(TERM_RED "MAX30102: Failed to initialize" TERM_RESET);
+  return false;
+}
+void verify_max30105_communication() {
+  if (!maxOperational) return;
+  
+  Serial.println("\nVerifying MAX30105 communication...");
+  
+  uint8_t revisionID = particleSensor.getRevisionID();
+  Serial.printf("MAX30105 Revision ID: 0x%02X\n", revisionID);
+  
+  delay(50);
+  float temp = particleSensor.readTemperature();
+  Serial.printf("MAX30105 Temperature: %.2f°C\n", temp);
+  
+  long irValue = particleSensor.getIR();
+  Serial.printf("MAX30105 IR Value: %ld\n", irValue);
+  
+  if (irValue > MAX30102_FINGER_DETECTION_THRESHOLD) {
+    Serial.println("MAX30105: Finger detected!");
+  } else {
+    Serial.println("MAX30105: No finger detected (place finger on sensor)");
+  }
+}
+
+bool initialize_i2c_sensors() {
+  bool all_ok = true;
+  Serial.println("I2C: Initializing sensors...");
+  
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(100000);
+  delay(250);
+  
+  scanI2C();
+  
+  ahtOperational = false;
+  for (int i = 0; i < 5; i++) {
+    if (aht.begin()) {
+      ahtOperational = true;
+      Serial.println(TERM_GREEN "I2C: AHT20 Initialized." TERM_RESET);
+      break;
+    }
+    Serial.println(TERM_YELLOW "I2C: AHT20 failed to initialize, retrying..." TERM_RESET);
+    delay(500);
+  }
+  
+  maxOperational = initialize_max30102();
+  
+  Serial.println("\n" TERM_CYAN "===== SENSOR INITIALIZATION SUMMARY =====" TERM_RESET);
+  Serial.printf("AHT20: %s\n", ahtOperational ? TERM_GREEN "SUCCESS" TERM_RESET : TERM_RED "FAILED" TERM_RESET);
+  Serial.printf("MAX30102: %s\n", maxOperational ? TERM_GREEN "SUCCESS" TERM_RESET : TERM_RED "FAILED" TERM_RESET);
+  Serial.println(TERM_CYAN "========================================" TERM_RESET);
+  
+  if (ahtOperational || maxOperational) {
+    Serial.println(TERM_GREEN "I2C: Speed set to 400kHz" TERM_RESET);
+    
+    if (maxOperational) {
+      verify_max30105_communication();
+    }
+  }
+  
+  return all_ok;
+}
+
+void process_max30102_data() {
+  if (!maxOperational) return;
+  
+  unsigned long currentMillis = millis();
+  long irValue = particleSensor.getIR();
+  bool fingerDetected = (irValue > MAX30102_FINGER_DETECTION_THRESHOLD);
+  
+  switch (max30102State) {
+    case MAX30102_IDLE:
+      if (fingerDetected) {
+        max30102_finger_detection_start = currentMillis;
+        max30102State = MAX30102_FINGER_DETECTED;
+        currentDisplayMode = MEDICAL_SENSORS;
+        tft.fillScreen(UI_BG); 
+      }
+      break;
+      
+    case MAX30102_FINGER_DETECTED:
+      if (fingerDetected) {
+        unsigned long elapsed = currentMillis - max30102_finger_detection_start;
+        int secondsRemaining = (MAX30102_FINGER_DETECTION_HOLD_MS - elapsed) / 1000 + 1;
+        
+        static int lastSec = -1;
+        if (secondsRemaining != lastSec) {
+            tft.fillScreen(UI_BG);
+            tft.setFont(); tft.setTextColor(UI_ACCENT); tft.setCursor(5, 5); tft.print("PREPARING");
+            
+            // Draw Big Countdown
+            tft.setFont(&FreeSansBold18pt7b); tft.setTextColor(UI_TEXT_MAIN);
+            tft.setCursor(55, 70); tft.print(secondsRemaining);
+            
+            tft.setFont(); tft.setTextColor(UI_TEXT_SUB);
+            tft.setCursor(30, 90); tft.print("Hold Still...");
+            
+            // Draw Progress Bar
+            int barWidth = map(elapsed, 0, MAX30102_FINGER_DETECTION_HOLD_MS, 0, 128);
+            tft.fillRect(0, 120, barWidth, 8, UI_ACCENT);
+            lastSec = secondsRemaining;
+        }
+
+        if (elapsed >= MAX30102_FINGER_DETECTION_HOLD_MS) {
+          max30102State = MAX30102_READING_HR_SPO2;
+          max30102_buffer_index = 0;
+          max30102_tempBufferIndex = 0;
+          memset(max30102_irBuffer, 0, sizeof(max30102_irBuffer));
+          memset(max30102_redBuffer, 0, sizeof(max30102_redBuffer));
+          tft.fillScreen(UI_BG); 
+        }
+      } else {
+        max30102State = MAX30102_IDLE;
+        set_primary_display();
+      }
+      break;
+      
+    case MAX30102_READING_HR_SPO2:
+      if (currentMillis - lastHrSpo2SampleTime >= MAX_READING_SAMPLE_PERIOD_MS) {
+        lastHrSpo2SampleTime = currentMillis;
+        if (particleSensor.available()) {
+          max30102_irBuffer[max30102_buffer_index] = particleSensor.getIR();
+          max30102_redBuffer[max30102_buffer_index] = particleSensor.getRed();
+          max30102_buffer_index++;
+          float temp = particleSensor.readTemperature();
+          if (!isnan(temp) && max30102_tempBufferIndex < 50) 
+             max30102_tempBuffer[max30102_tempBufferIndex++] = temp;
+          particleSensor.nextSample();
+        }
+        
+        // Draw Progress UI
+        if (max30102_buffer_index % 5 == 0) {
+            int pct = (max30102_buffer_index * 100) / MAX30102_BUFFER_SIZE;
+            tft.setFont(); tft.setTextColor(UI_ACCENT); tft.setCursor(5, 5); tft.print("SAMPLING");
+            tft.setFont(&FreeSansBold12pt7b); tft.setTextColor(UI_TEXT_MAIN);
+            tft.setCursor(35, 60); tft.print(pct); tft.print("%");
+            tft.drawRect(14, 80, 100, 12, UI_CARD_BG);
+            tft.fillRect(16, 82, pct, 8, UI_ACCENT);
+        }
+
+        if (max30102_buffer_index >= MAX30102_BUFFER_SIZE) {
+          max30102State = MAX30102_CALCULATING_HR_SPO2;
+        }
+      }
+      break;
+      
+    case MAX30102_CALCULATING_HR_SPO2: {
+      tft.fillScreen(UI_BG);
+      tft.setFont(); tft.setTextColor(UI_ACCENT); tft.setCursor(5, 5); tft.print("ANALYZING");
+      tft.setFont(&FreeSansBold9pt7b); tft.setTextColor(UI_TEXT_MAIN);
+      tft.setCursor(20, 60); tft.print("Processing...");
+      
+      maxim_heart_rate_and_oxygen_saturation(
+        max30102_irBuffer, max30102_buffer_index, max30102_redBuffer, 
+        &max30102_calculatedSpO2, &max30102_validSpO2, 
+        &max30102_calculatedHR, &max30102_validHR
+      );
+      
+      if (max30102_validHR) max30102_hr = (float)max30102_calculatedHR;
+      if (max30102_validSpO2) max30102_spo2 = (float)max30102_calculatedSpO2;
+      
+      float hTemp = 0;
+      for(int i=0; i<max30102_tempBufferIndex; i++) {
+         if(max30102_tempBuffer[i] > hTemp) hTemp = max30102_tempBuffer[i];
+      }
+      max30102_max_temp = hTemp;
+      
+      medicalDisplayStartTime = currentMillis;
+      max30102State = MAX30102_DISPLAY_RESULTS;
+      drawMedicalSensorScreen();
+      break;
+    }
+    
+    case MAX30102_DISPLAY_RESULTS:
+      if (currentMillis - medicalDisplayStartTime >= MEDICAL_DISPLAY_DURATION_MS) {
+        set_primary_display();
+        max30102State = MAX30102_IDLE;
+      }
+      break;
+  }
+}
+
+float getDistance() {
+  digitalWrite(US_TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(US_TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(US_TRIG_PIN, LOW);
+  
+  long duration = pulseIn(US_ECHO_PIN, HIGH, 60000);
+  
+  static unsigned long lastDebugOutput = 0;
+  unsigned long currentMillis = millis();
+  
+  if (currentMillis - lastDebugOutput >= 5000) {
+    if (duration == 0) {
+      Serial.println("Ultrasonic: No pulse detected (timeout)");
+    } else {
+      Serial.printf("Ultrasonic: Duration = %ld μs\n", duration);
+    }
+    lastDebugOutput = currentMillis;
+  }
+  
+  if (duration == 0) {
+    return NAN;
+  }
+  
+  float distance = duration * 0.034 / 2.0;
+  
+  if (distance <= 0 || distance > 400) {
+    return NAN;
+  }
+  
+  return distance;
+}
+
+// DISPLAY FUNCTIONS - FIXED: Enhanced AI display
+void displayCriticalError(String errorMessage, bool isSensorError) {
+  if (!tftOperational) return;
+  
+  currentDisplayMode = CRITICAL_ERROR_DISPLAY;
+  tft.fillScreen(UI_BG); tft.fillRect(0, 0, 128, 20, UI_ALERT);
+  tft.setFont(&FreeSansBold9pt7b); tft.setTextColor(ST77XX_BLACK); tft.setCursor(30, 15); tft.print("ERROR");
+  tft.setFont(&FreeSansBold12pt7b); tft.setTextColor(UI_TEXT_MAIN); tft.setCursor(10, 60); tft.print("SYSTEM ERROR");
+  tft.setFont(); tft.setTextColor(UI_TEXT_MAIN);
+  int y = 80; int len = errorMessage.length();
+  for (int i = 0; i < len; i += 18) {
+    tft.setCursor(5, y); int end = (i + 18 < len) ? i + 18 : len;
+    tft.print(errorMessage.substring(i, end)); y += 12;
+  }
+  tft.setTextColor(UI_TEXT_SUB); tft.setCursor(5, 110);
+  if (isSensorError) tft.print("Check Wiring"); else tft.print("System Halted");
+}
+
+void drawSplashScreen() {
+  if (!tftOperational) return;
+  tft.fillScreen(UI_BG); tft.drawCircle(64, 60, 30, UI_ACCENT); tft.drawCircle(64, 60, 29, UI_ACCENT);
+  tft.setTextColor(UI_TEXT_MAIN); tft.setTextSize(2); tft.setCursor(40, 53); tft.print("ELLA");
+  tft.setTextSize(1); tft.setTextColor(UI_ACCENT); tft.setCursor(35, 95); tft.print("INITIALIZING");
+  tft.drawRect(24, 110, 80, 4, UI_CARD_BG); tft.fillRect(24, 110, 40, 4, UI_ACCENT); 
+}
+
+void drawAmbientSensorScreen() {
+  struct tm timeinfo;
+  bool haveTime = getLocalTime(&timeinfo);
+  
+  if (currentDisplayMode != lastDrawnMode) {
+    tft.fillScreen(UI_BG);
+    tft.setFont(); tft.setTextColor(UI_TEXT_SUB);
+    tft.setCursor(5, 5); tft.print("HOME");
+    drawWiFiIndicator(120, 5); 
+
+    // Time
+    tft.setFont(&FreeSansBold18pt7b); tft.setTextColor(UI_TEXT_MAIN);
+    tft.setCursor(15, 50); 
+    if (haveTime) tft.print(&timeinfo, "%H:%M"); else tft.print("--:--");
+
+    // Cards
+    drawCard(0, 65, 62, 58, UI_CARD_BG);
+    drawCard(66, 65, 62, 58, UI_CARD_BG);
+    tft.setFont(); tft.setTextColor(UI_TEXT_SUB);
+    tft.setCursor(5, 70); tft.print("HUM"); tft.setCursor(71, 70); tft.print("TMP");
+    tft.setTextColor(UI_INFO); tft.setCursor(35, 105); tft.print("%");
+    tft.setTextColor(UI_ACCENT); tft.setCursor(95, 105); tft.print("C");
+  }
+
+  // Update Time Minute
+  static int lastMin = -1;
+  if (haveTime && timeinfo.tm_min != lastMin) {
+      tft.fillRect(15, 25, 100, 30, UI_BG);
+      tft.setFont(&FreeSansBold18pt7b); tft.setTextColor(UI_TEXT_MAIN);
+      tft.setCursor(15, 50); tft.print(&timeinfo, "%H:%M");
+      lastMin = timeinfo.tm_min;
+  }
+
+  // Update Sensors
+  tft.setFont(&FreeSansBold12pt7b);
+  tft.fillRect(5, 85, 30, 20, UI_CARD_BG); tft.setTextColor(UI_TEXT_MAIN); tft.setCursor(5, 105);
+  if(!isnan(humidity_aht)) tft.print(humidity_aht, 0); else tft.print("--");
+
+  tft.fillRect(71, 85, 30, 20, UI_CARD_BG); tft.setCursor(71, 105);
+  if(!isnan(temp_aht)) tft.print(temp_aht, 0); else tft.print("--");
+  
+  tft.setFont();
+}
+
+void drawMedicalSensorScreen() {
+  if (currentDisplayMode != lastDrawnMode) {
+    tft.fillScreen(UI_BG);
+    tft.setFont(); tft.setTextColor(UI_ALERT); tft.setCursor(5, 5); tft.print("HEART RATE");
+    drawWiFiIndicator(120, 5);
+
+    // Graph
+    tft.fillRect(0, 58, 128, 25, 0x3000); 
+    uint16_t c = UI_ALERT; int y = 70;
+    tft.drawLine(0,y,30,y,c); tft.drawLine(30,y,35,y-8,c); tft.drawLine(35,y-8,40,y+8,c);
+    tft.drawLine(40,y+8,45,y,c); tft.drawLine(45,y,60,y,c); tft.drawLine(60,y,65,y-12,c);
+    tft.drawLine(65,y-12,70,y+12,c); tft.drawLine(70,y+12,75,y,c); tft.drawLine(75,y,128,y,c);
+
+    drawCard(0, 88, 62, 38, UI_CARD_BG); drawCard(66, 88, 62, 38, UI_CARD_BG);
+    tft.setTextColor(UI_TEXT_SUB); tft.setCursor(5, 95); tft.print("SpO2"); tft.setCursor(71, 95); tft.print("TEMP");
+  }
+
+  // Live Values
+  tft.fillRect(20, 20, 60, 30, UI_BG);
+  tft.setFont(&FreeSansBold18pt7b); tft.setTextColor(UI_TEXT_MAIN); tft.setCursor(20, 48); 
+  if(max30102_hr > 0) tft.print(max30102_hr, 0); else tft.print("--");
+  tft.setFont(); tft.setTextColor(UI_ALERT); tft.setCursor(85, 35); tft.print("BPM");
+
+  tft.setFont(&FreeSansBold9pt7b);
+  tft.fillRect(5, 108, 50, 15, UI_CARD_BG); tft.setTextColor(UI_INFO); tft.setCursor(5, 120);
+  if(max30102_spo2 > 0) { tft.print(max30102_spo2, 0); } else tft.print("--");
+
+  tft.fillRect(71, 108, 50, 15, UI_CARD_BG); tft.setTextColor(UI_ACCENT); tft.setCursor(71, 120);
+  if(max30102_max_temp > 0) tft.print(max30102_max_temp, 0); else tft.print("--");
+  tft.setFont();
+}
+
+void drawRobotStatusScreen() {
+  if (currentDisplayMode != lastDrawnMode) {
+    tft.fillScreen(UI_BG);
+    tft.setFont(); tft.setTextColor(UI_TEXT_MAIN); tft.setCursor(5, 5); tft.print("STATUS");
+    drawCard(0, 25, 128, 50, UI_CARD_BG); drawCard(0, 80, 128, 45, UI_CARD_BG);
+    tft.setTextColor(UI_TEXT_SUB); tft.setCursor(10, 35); tft.print("DISTANCE"); tft.setCursor(10, 90); tft.print("MODE");
+  }
+  tft.setFont(&FreeSansBold18pt7b); tft.fillRect(10, 50, 80, 20, UI_CARD_BG);
+  tft.setTextColor(UI_ACCENT); tft.setCursor(10, 70);
+  if (!isnan(distance_cm)) tft.print(distance_cm, 0); else tft.print("--");
+  tft.setFont(); tft.setTextColor(UI_TEXT_SUB); tft.setCursor(90, 65); tft.print("cm");
+
+  tft.setFont(&FreeSansBold9pt7b); tft.fillRect(10, 105, 110, 18, UI_CARD_BG);
+  if (patrolMode) { tft.setTextColor(UI_SUCCESS); tft.setCursor(10, 120); tft.print("PATROL ON"); } 
+  else { tft.setTextColor(UI_TEXT_MAIN); tft.setCursor(10, 120); tft.print("MANUAL"); }
+  tft.setFont();
+}
+
+void drawSensorAlertScreen(String alertType, String alertMessage) {
+  if (currentDisplayMode != lastDrawnMode) {
+    tft.fillScreen(UI_BG); tft.fillRect(0, 0, 128, 25, UI_ALERT);
+    tft.setFont(&FreeSansBold9pt7b); tft.setTextColor(ST77XX_BLACK); tft.setCursor(35, 18); tft.print("ALERT!");
+    tft.setFont(&FreeSansBold12pt7b); tft.setTextColor(UI_TEXT_MAIN); tft.setCursor(10, 60); tft.print(alertType);
+    tft.setFont(); tft.setTextColor(UI_TEXT_SUB); tft.setCursor(10, 80); tft.print(alertMessage);
+    tft.drawCircle(64, 105, 15, UI_ALERT); tft.setFont(&FreeSansBold18pt7b); tft.setTextColor(UI_ALERT); tft.setCursor(58, 115); tft.print("!");
+  }
+  tft.setFont();
+}
+
+void drawVoiceCommandDisplay(const String& title, const String& detail) {
+  if (currentDisplayMode != lastDrawnMode) {
+    tft.fillScreen(UI_BG);
+    tft.setFont(); tft.setTextColor(UI_ACCENT); tft.setCursor(5, 5); tft.print("VOICE CMD");
+    drawCard(0, 25, 128, 80, UI_CARD_BG);
+    tft.setFont(&FreeSansBold12pt7b); tft.setTextColor(UI_TEXT_MAIN); tft.setCursor(10, 55); tft.print(title);
+    tft.setFont(); tft.setTextColor(UI_TEXT_SUB); tft.setCursor(10, 75); tft.print(detail);
+    tft.fillRect(10, 95, 108, 4, UI_ACCENT);
+  }
+}
+
+// FIXED: Enhanced AI Mode Display - Simplified and more reliable
+void drawAiModeScreen() {
+  if (currentDisplayMode != lastDrawnMode) tft.fillScreen(UI_BG);
+  int cx = 64, cy = 50; 
+  tft.fillRect(10, 20, 108, 65, UI_BG); 
+
+  if (currentAiState == AI_SPEAKING || currentAiState == AI_PLAYING_TTS) {
+      int h = random(10, 35);
+      tft.fillRect(cx-15, cy-10, 8, 20, UI_ACCENT); tft.fillRect(cx-2, cy-(h/2), 8, h, UI_ACCENT); tft.fillRect(cx+11, cy-10, 8, 20, UI_ACCENT);
+      tft.setFont(&FreeSansBold9pt7b); tft.setTextColor(UI_ACCENT); tft.setCursor(25, 100); 
+      tft.fillRect(0, 85, 128, 20, UI_BG); tft.print("Speaking...");
+  } else if (currentAiState == AI_RECORDING_AUDIO) {
+      tft.fillCircle(cx, cy, 12, UI_TEXT_MAIN); tft.drawCircle(cx, cy, 22, UI_ALERT);
+      tft.setFont(&FreeSansBold9pt7b); tft.setTextColor(UI_ALERT); tft.setCursor(25, 100); 
+      tft.fillRect(0, 85, 128, 20, UI_BG); tft.print("Listening");
+  } else if (currentAiState == AI_THINKING || currentAiState == AI_SENDING_TO_GEMINI || currentAiState == AI_GETTING_TTS) {
+      tft.drawCircle(cx, cy, 18, UI_INFO); tft.fillCircle(cx, cy, 5, UI_INFO);
+      tft.setFont(&FreeSansBold9pt7b); tft.setTextColor(UI_INFO); tft.setCursor(25, 100); 
+      tft.fillRect(0, 85, 128, 20, UI_BG); tft.print("Thinking...");
+  } else if (currentAiState == AI_UPLOADING_AUDIO) {
+      tft.drawLine(cx, cy-15, cx, cy+15, UI_ACCENT); tft.drawLine(cx, cy-15, cx-10, cy, UI_ACCENT); tft.drawLine(cx, cy-15, cx+10, cy, UI_ACCENT);
+      tft.setFont(&FreeSansBold9pt7b); tft.setTextColor(UI_ACCENT); tft.setCursor(20, 100); 
+      tft.fillRect(0, 85, 128, 20, UI_BG); tft.print("Uploading...");
+  } else {
+      tft.drawCircle(cx, cy, 18, UI_ACCENT); tft.fillCircle(cx, cy, 5, UI_ACCENT);
+      tft.setFont(&FreeSansBold9pt7b); tft.setTextColor(UI_TEXT_MAIN); tft.setCursor(25, 90); tft.print("Hi, I'm Ella");
+      drawCard(10, 100, 108, 24, UI_CARD_BG);
+      tft.setFont(); tft.setTextColor(UI_TEXT_SUB); tft.setCursor(35, 115); tft.print("Tap to Ask");
+  }
+  tft.setFont();
+}
+
+// Draw current button mode on display
+void drawCurrentMode() {
+  // Only draw if we are on the Home or Status screen
+  if (currentDisplayMode == AMBIENT_SENSORS || currentDisplayMode == ROBOT_STATUS) {
+    // Top-Right Badge
+    drawCard(88, 5, 38, 14, UI_CARD_BG);
+    tft.setTextColor(UI_ACCENT); tft.setTextSize(1);
+    tft.setCursor(92, 8);
+    
+    switch (currentButtonMode) {
+      case MODE_NORMAL:   tft.print("NORM"); break;
+      case MODE_SU03T:    tft.print("VOICE"); break;
+      case MODE_AI:       tft.print("AI"); break;
+      case MODE_OBSTACLE: tft.print("OBS"); break;
+      default:            tft.print("---"); break;
+    }
+  }
+}
+
+// Get mode name as string
+String getModeName(ButtonMode mode) {
+  switch (mode) {
+    case MODE_NORMAL: return "Normal";
+    case MODE_SU03T: return "SU03T";
+    case MODE_AI: return "AI Mode";
+    case MODE_OBSTACLE: return "Obstacle " + String(obstacle_avoidance_active ? "ON" : "OFF");
+    default: return "Unknown";
+  }
+}
+
+// PSRAM Initialization
+void initPSRAM() {
+  if (!psramInit()) {
+    Serial.println("PSRAM initialization failed!");
+    return;
+  }
+  
+  Serial.print("Total PSRAM: ");
+  Serial.println(ESP.getPsramSize());
+  Serial.print("Free PSRAM: ");
+  Serial.println(ESP.getFreePsram());
+  
+  // Don't allocate the buffer here - we'll allocate it when needed
+  audio_buffer = NULL;
+  audio_buffer_size = 0;
+  
+  Serial.println("PSRAM initialized successfully!");
+}
+
+// I2S Recording Initialization - OPTIMIZED
+bool I2S_Record_Init() {
+  // If already initialized, disable and clean up first
+  if (rx_handle != NULL) {
+    i2s_channel_disable(rx_handle);
+    i2s_del_channel(rx_handle);
+    rx_handle = NULL;
+  }
+  
+  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
+  
+  if (i2s_new_channel(&chan_cfg, NULL, &rx_handle) != ESP_OK) {
+    Serial.println("Failed to create I2S channel");
+    return false;
+  }
+  
+  if (i2s_channel_init_std_mode(rx_handle, &std_cfg) != ESP_OK) {
+    Serial.println("Failed to initialize I2S channel");
+    i2s_del_channel(rx_handle);
+    rx_handle = NULL;
+    return false;
+  }
+  
+  if (i2s_channel_enable(rx_handle) != ESP_OK) {
+    Serial.println("Failed to enable I2S channel");
+    i2s_del_channel(rx_handle);
+    rx_handle = NULL;
+    return false;
+  }
+  
+  Serial.println("I2S recording initialized successfully");
+  return true;
+}
+
+// Continue Recording to PSRAM
+bool Record_Continue() {
+  if (rx_handle == NULL || audio_buffer == NULL) {
+    Serial.println("I2S handle or audio buffer is NULL, cannot record");
+    return false;
+  }
+  
+  int16_t audio_buffer_16bit[1024];
+  size_t bytes_read = 0;
+  
+  // Try to read from I2S with timeout
+  esp_err_t result = i2s_channel_read(rx_handle, audio_buffer_16bit, sizeof(audio_buffer_16bit), &bytes_read, pdMS_TO_TICKS(100));
+  
+  if (result != ESP_OK) {
+    Serial.println("Failed to read from I2S");
+    return false;
+  }
+  
+  if (bytes_read == 0) {
+    return true; // No data available but not an error
+  }
+  
+  // Apply gain with clipping protection
+  if (GAIN_BOOSTER_I2S > 1) {
+    for (int16_t i = 0; i < (bytes_read / 2); ++i) {
+      int32_t sample = (int32_t)audio_buffer_16bit[i] * GAIN_BOOSTER_I2S;
+      // Clip to prevent overflow
+      if (sample > 32767) sample = 32767;
+      if (sample < -32768) sample = -32768;
+      audio_buffer_16bit[i] = (int16_t)sample;
+    }
+  }
+  
+  // Store 16-bit audio directly
+  if (audio_buffer_size + bytes_read <= MAX_AUDIO_BUFFER_SIZE) {
+    memcpy(&audio_buffer[audio_buffer_size], audio_buffer_16bit, bytes_read);
+    audio_buffer_size += bytes_read;
+  } else {
+    Serial.println("Audio buffer full!");
+    return false;
+  }
+  
+  return true;
+}
+
+// Audio Analysis Function for Debugging
+void analyzeAudio() {
+  if (audio_buffer_size == 0) return;
+  
+  int32_t sum = 0;
+  int16_t min_sample = 32767;
+  int16_t max_sample = -32768;
+  int zero_crossings = 0;
+  bool last_positive = false;
+  
+  int samples_to_analyze = (int)min((size_t)1000, audio_buffer_size / 2);
+  int16_t* audio_data = (int16_t*)audio_buffer;
+  
+  for (int i = 0; i < samples_to_analyze; i++) {
+    int16_t sample = audio_data[i];
+    sum += abs(sample);
+    if (sample < min_sample) min_sample = sample;
+    if (sample > max_sample) max_sample = sample;
+    
+    bool current_positive = sample > 0;
+    if (last_positive != current_positive) {
+      zero_crossings++;
+    }
+    last_positive = current_positive;
+  }
+  
+  float avg_amplitude = (float)sum / samples_to_analyze;
+  float dynamic_range = max_sample - min_sample;
+  
+  Serial.println("\n=== Audio Analysis ===");
+  Serial.println("Samples analyzed: " + String(samples_to_analyze));
+  Serial.println("Average amplitude: " + String(avg_amplitude));
+  Serial.println("Min sample: " + String(min_sample));
+  Serial.println("Max sample: " + String(max_sample));
+  Serial.println("Dynamic range: " + String(dynamic_range));
+  Serial.println("Zero crossings: " + String(zero_crossings));
+  
+  if (avg_amplitude < 1000) {
+    Serial.println("WARNING: Audio level too low!");
+  } else if (avg_amplitude > 15000) {
+    Serial.println("WARNING: Audio level too high (possible clipping)!");
+  }
+  
+  if (dynamic_range < 5000) {
+    Serial.println("WARNING: Low dynamic range (possible silence)");
+  }
+  
+  if (zero_crossings < 10) {
+    Serial.println("WARNING: Very few zero crossings (possible DC offset)");
+  }
+  
+  Serial.println("====================\n");
+}
+
+// Create WAV header for PCM audio data
+void createWAVHeader(uint8_t* buffer, size_t dataSize, uint32_t sampleRate, uint16_t bitsPerSample, uint16_t channels) {
+  struct __attribute__((packed)) WAVHeader {
+    char riff[4] = {'R', 'I', 'F', 'F'};
+    uint32_t fileSize;
+    char wave[4] = {'W', 'A', 'V', 'E'};
+    char fmt[4] = {'f', 'm', 't', ' '};
+    uint32_t fmtLength = 16;
+    uint16_t audioFormat = 1;
+    uint16_t numChannels;
+    uint32_t sampleRate;
+    uint32_t byteRate;
+    uint16_t blockAlign;
+    uint16_t bitsPerSample;
+    char data[4] = {'d', 'a', 't', 'a'};
+    uint32_t dataSize;
+  };
+  
+  WAVHeader header;
+  header.numChannels = channels;
+  header.sampleRate = sampleRate;
+  header.bitsPerSample = bitsPerSample;
+  header.byteRate = sampleRate * channels * bitsPerSample / 8;
+  header.blockAlign = channels * bitsPerSample / 8;
+  header.dataSize = dataSize;
+  header.fileSize = 36 + dataSize;
+  
+  memcpy(buffer, &header, sizeof(WAVHeader));
+}
+
+// Groq Speech-to-Text with PCM Audio
+String SpeechToText_Groq(uint8_t* audio_data, size_t audio_size) {
+  uint32_t t_start = millis();
+  
+  WiFiClientSecure groqClient;
+  groqClient.setInsecure();
+  
+  DebugPrintln("> Initialize Groq Server connection... ");
+  if (!groqClient.connect("api.groq.com", 443)) {
+    Serial.println("\nERROR - Connection to Groq Server failed!");
+    return "";
+  }
+  DebugPrintln("Done. Connected to Groq Server.");
+  
+  if (audio_data == NULL || audio_size == 0) {
+    Serial.println("ERROR - No audio data provided");
+    return "";
+  }
+  
+  DebugPrintln("> Audio data found, size: " + String(audio_size));
+  
+  size_t wavBufferSize = audio_size + 44;
+  uint8_t* wavBuffer = (uint8_t*)ps_malloc(wavBufferSize);
+  
+  if (wavBuffer == NULL) {
+    Serial.println("ERROR - Failed to allocate WAV buffer!");
+    return "";
+  }
+  
+  createWAVHeader(wavBuffer, audio_size, SAMPLE_RATE, BITS_PER_SAMPLE, 1);
+  memcpy(wavBuffer + 44, audio_data, audio_size);
+  
+  String boundary = "----ESP32GroqBoundary" + String(millis());
+  String contentType = "multipart/form-data; boundary=" + boundary;
+  
+  String formDataStart = "--" + boundary + "\r\n";
+  formDataStart += "Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\n";
+  formDataStart += "Content-Type: audio/wav\r\n\r\n";
+  
+  String formDataEnd = "\r\n--" + boundary + "\r\n";
+  formDataEnd += "Content-Disposition: form-data; name=\"model\"\r\n\r\n";
+  formDataEnd += "whisper-large-v3-turbo\r\n";
+  
+  formDataEnd += "--" + boundary + "\r\n";
+  formDataEnd += "Content-Disposition: form-data; name=\"language\"\r\n\r\n";
+  formDataEnd += "en\r\n";
+  
+  formDataEnd += "--" + boundary + "\r\n";
+  formDataEnd += "Content-Disposition: form-data; name=\"response_format\"\r\n\r\n";
+  formDataEnd += "json\r\n";
+  
+  formDataEnd += "--" + boundary + "--\r\n";
+  
+  size_t totalSize = formDataStart.length() + wavBufferSize + formDataEnd.length();
+  
+  groqClient.println("POST /openai/v1/audio/transcriptions HTTP/1.1");
+  groqClient.println("Host: api.groq.com");
+  groqClient.println("Authorization: Bearer " + String(GROQ_API_KEY));
+  groqClient.println("Content-Type: " + contentType);
+  groqClient.println("Content-Length: " + String(totalSize));
+  groqClient.println();
+  
+  DebugPrintln("> Sending audio to Groq...");
+  
+  groqClient.print(formDataStart);
+  
+  const size_t chunkSize = 1024;
+  size_t totalSent = 0;
+  
+  while (totalSent < wavBufferSize) {
+    size_t bytesToSend = min(chunkSize, wavBufferSize - totalSent);
+    size_t bytesSent = groqClient.write(&wavBuffer[totalSent], bytesToSend);
+    
+    if (bytesSent == 0) {
+      delay(10);
+      continue;
+    }
+    
+    totalSent += bytesSent;
+    delay(1);
+  }
+  
+  groqClient.print(formDataEnd);
+  
+  free(wavBuffer);
+  
+  DebugPrintln("> Sent " + String(totalSent) + " bytes, waiting for response...");
+  
+  String response = "";
+  uint32_t startTime = millis();
+  uint32_t lastActivity = millis();
+  
+  while (millis() - startTime < 10000) {
+    while (groqClient.available()) {
+      char c = groqClient.read();
+      response += c;
+      lastActivity = millis();
+    }
+    
+    if (response.length() > 100 && response.indexOf("}") != -1) {
+      break;
+    }
+    
+    if (millis() - lastActivity > 2000) {
+      break;
+    }
+    
+    delay(10);
+  }
+  
+  groqClient.stop();
+  
+  String transcription = parseGroqResponse(response);
+  
+  uint32_t total_time = millis() - t_start;
+  Serial.println("Groq processing time: " + String(total_time) + "ms");
+  
+  return transcription;
+}
+
+// Parse Groq API Response
+String parseGroqResponse(String response) {
+  int jsonStart = response.indexOf("{");
+  int jsonEnd = response.lastIndexOf("}");
+  
+  if (jsonStart != -1 && jsonEnd != -1) {
+    String jsonPart = response.substring(jsonStart, jsonEnd + 1);
+    
+    JsonDocument doc;  // Fixed: removed size parameter
+    DeserializationError error = deserializeJson(doc, jsonPart);
+    
+    if (error) {
+      Serial.print("deserializeJson() failed: ");
+      Serial.println(error.c_str());
+      return "";
+    }
+    
+    if (doc["text"].is<const char*>()) {  // Fixed: replaced deprecated containsKey
+      String text = doc["text"].as<String>();
+      text.trim();
+      return text;
+    }
+  }
+  
+  return "";
+}
+
+// Get Response from Gemini 2.0 Flash AI with Persona
+String getGeminiResponse(String input) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  
+  const char* host = "generativelanguage.googleapis.com";
+  const int port = 443;
+  
+  if (!client.connect(host, port)) {
+    Serial.println("ERROR - Connection to Gemini API failed!");
+    return "Error connecting to AI.";
+  }
+  
+  input.replace("\"", "\\\"");
+  input.replace("\n", " ");
+  
+  String jsonPayload = "{";
+  jsonPayload += "\"contents\":[{\"parts\":[{\"text\":\"";
+  jsonPayload += AI_PERSONA;
+  jsonPayload += "\\n\\nUser: ";
+  jsonPayload += input;
+  jsonPayload += "\"}]}]}";
+  
+  String url = "/v1beta/models/gemini-2.0-flash-exp:generateContent?key=" + String(GEMINI_API_KEY);
+  
+  client.println("POST " + url + " HTTP/1.1");
+  client.println("Host: " + String(host));
+  client.println("Content-Type: application/json");
+  client.println("Content-Length: " + String(jsonPayload.length()));
+  client.println();
+  client.println(jsonPayload);
+  
+  DebugPrintln("> Request sent to Gemini...");
+  
+  while (client.connected()) {
+    String line = client.readStringUntil('\n');
+    if (line == "\r") break;
+  }
+  
+  String response = client.readString();
+  client.stop();
+  
+  String aiText = parseGeminiResponse(response);
+  
+  if (aiText == "") {
+    if (response.indexOf("error") != -1) {
+      Serial.println("Gemini Error: " + response);
+      return "My brain is having a glitch.";
+    }
+  }
+  
+  return aiText;
+}
+
+// Parse Gemini API Response
+String parseGeminiResponse(String response) {
+  int contentStart = response.indexOf("\"text\":\"");
+  if (contentStart == -1) return "";
+  
+  int start = contentStart + 8;
+  int end = response.indexOf("\"", start);
+  
+  if (start != -1 && end != -1) {
+    String text = response.substring(start, end);
+    text.replace("\\n", " ");
+    text.replace("\\\"", "\"");
+    return text;
+  }
+  
+  return "";
+}
+
+// Google Text-to-Speech
+void Google_TTS(String text) {
+  speakTextInChunks(text, 93);
+}
+
+// Function to speak text in chunks
+void speakTextInChunks(String text, int maxLength) {
+  int start = 0;
+  while (start < text.length()) {
+    int end = start + maxLength;
+    if (end < text.length()) {
+      while (end > start && text[end] != ' ' && text[end] != '.' && text[end] != ',') {
+        end--;
+      }
+    }
+    if (end == start) {
+      end = start + maxLength;
+    }
+    String chunk = text.substring(start, end);
+    audio_play.connecttospeech(chunk.c_str(), TTS_GOOGLE_LANGUAGE);
+    while (audio_play.isRunning()) {
+      audio_play.loop();
+      if (digitalRead(pin_BOOT_BTN) == LOW) {
+        break;
+      }
+    }
+    start = end + 1;
+  }
+}
+
+// MOTOR CONTROL FUNCTIONS - SMOOTH CINEMATIC MOVEMENT
+void motor_stop() {
+  // Ramp Down (Smooth Braking)
+  if (currentMovement != MOVEMENT_STOPPED) {
+    for (int i = currentSpeedPWM; i >= 0; i -= 15) {
+      if (currentMovement == MOVEMENT_FORWARD) {
+         ledcWrite(MOT_A1_PIN, i); ledcWrite(MOT_B1_PIN, i);
+      } else if (currentMovement == MOVEMENT_BACKWARD) {
+         ledcWrite(MOT_A2_PIN, i); ledcWrite(MOT_B2_PIN, i);
+      }
+      delay(5);
+    }
+  }
+  
+  // Hard disable to ensure it stops completely
+  digitalWrite(MOT_A1_PIN, LOW); digitalWrite(MOT_A2_PIN, LOW);
+  digitalWrite(MOT_B1_PIN, LOW); digitalWrite(MOT_B2_PIN, LOW);
+  ledcWrite(MOT_A1_PIN, 0); ledcWrite(MOT_A2_PIN, 0);
+  ledcWrite(MOT_B1_PIN, 0); ledcWrite(MOT_B2_PIN, 0);
+  
+  currentMovement = MOVEMENT_STOPPED;
+}
+
+void motor_brake() {
+  Serial.println("Motor: BRAKE");
+  
+  // Brake stop: both pins HIGH
+  digitalWrite(MOT_A1_PIN, HIGH);
+  digitalWrite(MOT_A2_PIN, HIGH);
+  digitalWrite(MOT_B1_PIN, HIGH);
+  digitalWrite(MOT_B2_PIN, HIGH);
+  
+  delay(100); // Brake time
+  motor_stop();
+}
+
+void motor_forward() {
+  if (aiModeEnabled) {
+    Serial.println(TERM_YELLOW "Motor: Forward command ignored (AI mode active)" TERM_RESET);
+    return;
+  }
+  
+  currentMovement = MOVEMENT_FORWARD;
+  
+  // Ramp Up (0 to Target Speed) - Cinematic Acceleration
+  for (int i = 0; i <= currentSpeedPWM; i += 10) {
+    digitalWrite(MOT_A2_PIN, LOW); ledcWrite(MOT_A1_PIN, i);
+    digitalWrite(MOT_B2_PIN, LOW); ledcWrite(MOT_B1_PIN, i);
+    delay(5); // Adjust this delay to change acceleration smoothness
+  }
+  // Ensure we hit final speed
+  ledcWrite(MOT_A1_PIN, currentSpeedPWM);
+  ledcWrite(MOT_B1_PIN, currentSpeedPWM);
+}
+
+void motor_reverse() {
+  if (aiModeEnabled) {
+    Serial.println(TERM_YELLOW "Motor: Reverse command ignored (AI mode active)" TERM_RESET);
+    return;
+  }
+  
+  currentMovement = MOVEMENT_BACKWARD;
+
+  // Ramp Up (0 to Target Speed)
+  for (int i = 0; i <= currentSpeedPWM; i += 10) {
+    digitalWrite(MOT_A1_PIN, LOW); ledcWrite(MOT_A2_PIN, i);
+    digitalWrite(MOT_B1_PIN, LOW); ledcWrite(MOT_B2_PIN, i);
+    delay(5);
+  }
+  ledcWrite(MOT_A2_PIN, currentSpeedPWM);
+  ledcWrite(MOT_B2_PIN, currentSpeedPWM);
+}
+
+void motor_left() {
+  if (aiModeEnabled) {
+    Serial.println(TERM_YELLOW "Motor: Left command ignored (AI mode active)" TERM_RESET);
+    return;
+  }
+  
+  Serial.println("Motor: LEFT");
+  
+  // Apply starting boost if speed is low
+  int boostSpeed = (currentSpeedPWM < 200) ? 255 : currentSpeedPWM;
+  
+  // Motor A: A1=PWM, A2=LOW (forward)
+  digitalWrite(MOT_A2_PIN, LOW);
+  ledcWrite(MOT_A1_PIN, boostSpeed);
+  
+  // Motor B: B1=LOW, B2=PWM (reverse)
+  digitalWrite(MOT_B1_PIN, LOW);
+  ledcWrite(MOT_B2_PIN, boostSpeed);
+  
+  // If we used boost, reduce to normal speed after 200ms
+  if (boostSpeed > currentSpeedPWM) {
+    delay(200);
+    ledcWrite(MOT_A1_PIN, currentSpeedPWM);
+    ledcWrite(MOT_B2_PIN, currentSpeedPWM);
+  }
+  
+  currentMovement = MOVEMENT_LEFT;
+}
+
+void motor_right() {
+  if (aiModeEnabled) {
+    Serial.println(TERM_YELLOW "Motor: Right command ignored (AI mode active)" TERM_RESET);
+    return;
+  }
+  
+  Serial.println("Motor: RIGHT");
+  
+  // Apply starting boost if speed is low
+  int boostSpeed = (currentSpeedPWM < 200) ? 255 : currentSpeedPWM;
+  
+  // Motor A: A1=LOW, A2=PWM (reverse)
+  digitalWrite(MOT_A1_PIN, LOW);
+  ledcWrite(MOT_A2_PIN, boostSpeed);
+  
+  // Motor B: B1=PWM, B2=LOW (forward)
+  digitalWrite(MOT_B2_PIN, LOW);
+  ledcWrite(MOT_B1_PIN, boostSpeed);
+  
+  // If we used boost, reduce to normal speed after 200ms
+  if (boostSpeed > currentSpeedPWM) {
+    delay(200);
+    ledcWrite(MOT_A2_PIN, currentSpeedPWM);
+    ledcWrite(MOT_B1_PIN, currentSpeedPWM);
+  }
+  
+  currentMovement = MOVEMENT_RIGHT;
+}
+
+void setup_motor_control() {
+  Serial.println("Setting up motor control...");
+  
+  // Set pin modes
+  pinMode(MOT_A1_PIN, OUTPUT);
+  pinMode(MOT_A2_PIN, OUTPUT);
+  pinMode(MOT_B1_PIN, OUTPUT);
+  pinMode(MOT_B2_PIN, OUTPUT);
+  pinMode(DRV8833_STBY, OUTPUT);
+  
+  // CRITICAL: Enable the motor driver
+  digitalWrite(DRV8833_STBY, HIGH);
+  Serial.println("DRV8833 STBY pin set to HIGH (enabled)");
+  
+  // Setup PWM channels for ESP32-S3
+  ledcAttach(MOT_A1_PIN, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(MOT_A2_PIN, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(MOT_B1_PIN, PWM_FREQ, PWM_RESOLUTION);
+  ledcAttach(MOT_B2_PIN, PWM_FREQ, PWM_RESOLUTION);
+  
+  // Initialize all pins to LOW
+  digitalWrite(MOT_A1_PIN, LOW);
+  digitalWrite(MOT_A2_PIN, LOW);
+  digitalWrite(MOT_B1_PIN, LOW);
+  digitalWrite(MOT_B2_PIN, LOW);
+  
+  // Initialize PWM to 0
+  ledcWrite(MOT_A1_PIN, 0);
+  ledcWrite(MOT_A2_PIN, 0);
+  ledcWrite(MOT_B1_PIN, 0);
+  ledcWrite(MOT_B2_PIN, 0);
+  
+  Serial.println(TERM_GREEN "Motor control setup complete!" TERM_RESET);
+}
+
+// COMMAND HANDLING
+void initCommandSystem() {
+  cmdContext.state = CMD_STATE_IDLE;
+  cmdContext.lastCommandTime = 0;
+  cmdContext.terminalCommandMode = false;
+  cmdContext.terminalBuffer = "";
+  cmdContext.ignoredCommandMessageShown = false;
+  
+  aiModeEnabled = false;
+  su03tListening = true;
+  su03tConnected = false;
+  currentControlSource = CONTROL_SOURCE_WEB;
+  
+  Serial.println(TERM_GREEN "Command System: Initialized with WEB CONTROL" TERM_RESET);
+  Serial.println("Available terminal commands:");
+  Serial.println("  ai on/off     - Activate/deactivate AI mode");
+  Serial.println("  su03t on/off  - Enable/disable SU-03T listening");
+  Serial.println("  button modes  - Show current button mode cycling");
+  Serial.println("  tts <text>    - Test TTS with text input");
+  Serial.println("  testmic       - Test microphone functionality");
+  Serial.println("  testnet       - Test internet connection");
+  Serial.println("  sensors       - Display all sensor readings");
+  Serial.println("  status        - Show current system status");
+  Serial.println("  debug record  - Debug recording state");
+  Serial.println("  help          - Show this help message");
+}
+
+// FIXED: Enhanced SU03T setup and connection checking
+void setupSU03T() {
+  Serial.println("Setting up SU03T...");
+  
+  su03tSerial.begin(115200, SERIAL_8N1, SU03T_RX_PIN, -1);
+  
+  su03tConnected = false;
+  su03tListening = true;
+  
+  Serial.println("SU-03T initialized. Listening for commands...");
+}
+
+void checkSu03tConnection() {
+  if (!su03tListening) {
+    // Drain any pending data to prevent buffer overflow
+    while (su03tSerial.available() > 0) {
+      su03tSerial.read();
+    }
+    return;
+  }
+  
+  while (su03tSerial.available() > 0) {
+    uint8_t command = su03tSerial.read();
+    processSu03tCommand(command);
+  }
+}
+
+void processSu03tCommand(uint8_t command) {
+  unsigned long currentTime = millis();
+  cmdContext.lastCommandTime = currentTime;
+  Serial.printf(TERM_CYAN "SU03T Command: 0x%02X\n" TERM_RESET, command);
+  
+  switch (command) {
+    case SU03T_CMD_AI_START:
+      if (!aiModeEnabled) {
+        Serial.println(TERM_GREEN " → Activating AI mode" TERM_RESET);
+        aiModeEnabled = true;
+        currentControlSource = CONTROL_SOURCE_AI;
+        startAiMode();
+        cmdContext.state = CMD_STATE_AI_READY;
+        displayCommandOnTFT_nonBlocking("AI Mode", "Activated", 1500);
+      }
+      break;
+      
+    case SU03T_CMD_AI_CONFIRM:
+      if (aiModeEnabled) {
+        if (cmdContext.state == CMD_STATE_AI_READY) {
+          Serial.println(TERM_GREEN " → Starting voice recording" TERM_RESET);
+          audio_recording = false;
+          audio_buffer_size = 0;
+          audioRecordingStartTime = millis(); 
+          currentAiState = AI_RECORDING_AUDIO;
+          cmdContext.state = CMD_STATE_RECORDING;
+        }
+      }
+      break;
+      
+    case SU03T_CMD_AI_EXIT:
+      if (aiModeEnabled) {
+        Serial.println(TERM_GREEN " → Exiting AI mode" TERM_RESET);
+        aiModeEnabled = false;
+        currentControlSource = CONTROL_SOURCE_WEB;
+        exitAiMode();
+      }
+      break;
+      
+    case SU03T_CMD_FORWARD:
+      if (!aiModeEnabled) motor_forward();
+      break;
+      
+    case SU03T_CMD_BACKWARD:
+      if (!aiModeEnabled) motor_reverse();
+      break;
+      
+    case SU03T_CMD_LEFT:
+      if (!aiModeEnabled) motor_left();
+      break;
+      
+    case SU03T_CMD_RIGHT:
+      if (!aiModeEnabled) motor_right();
+      break;
+      
+    case SU03T_CMD_STOP:
+      if (!aiModeEnabled) motor_stop();
+      break;
+      
+    default:
+      Serial.printf("Unknown Command: 0x%02X\n", command);
+      break;
+  }
+}
+
+void debugRecordingState() {
+  Serial.println(TERM_CYAN "=== Recording State Debug ===" TERM_RESET);
+  Serial.printf("audio_recording: %s\n", audio_recording ? "TRUE" : "FALSE");
+  Serial.printf("audio_buffer: %s\n", audio_buffer == NULL ? "NULL" : "ALLOCATED");
+  Serial.printf("audio_buffer_size: %d bytes\n", audio_buffer_size);
+  Serial.printf("audioRecordingStartTime: %lu ms\n", audioRecordingStartTime);
+  Serial.printf("rx_handle: %s\n", rx_handle == NULL ? "NULL" : "INITIALIZED");
+  Serial.printf("currentAiState: %d\n", currentAiState);
+  Serial.printf("cmdContext.state: %d\n", cmdContext.state);
+  Serial.println(TERM_CYAN "=============================" TERM_RESET);
+}
+
+void printAllSensorData() {
+  Serial.println("\n" TERM_CYAN "===== SENSOR READINGS =====" TERM_RESET);
+  
+  Serial.print("Temperature: ");
+  if (isnan(temp_aht)) Serial.println(TERM_RED "N/A" TERM_RESET);
+  else Serial.printf(TERM_GREEN "%.1f°C\n" TERM_RESET, temp_aht);
+  
+  Serial.print("Humidity: ");
+  if (isnan(humidity_aht)) Serial.println(TERM_RED "N/A" TERM_RESET);
+  else Serial.printf(TERM_GREEN "%.1f%%\n" TERM_RESET, humidity_aht);
+  
+  Serial.print("Heart Rate: ");
+  if (isnan(max30102_hr)) Serial.println(TERM_RED "N/A" TERM_RESET);
+  else Serial.printf(TERM_GREEN "%.0f BPM\n" TERM_RESET, max30102_hr);
+  
+  Serial.print("SpO2: ");
+  if (isnan(max30102_spo2)) Serial.println(TERM_RED "N/A" TERM_RESET);
+  else Serial.printf(TERM_GREEN "%.1f%%\n" TERM_RESET, max30102_spo2);
+  
+  Serial.print("Finger Temp: ");
+  if (isnan(max30102_max_temp)) Serial.println(TERM_RED "N/A" TERM_RESET);
+  else Serial.printf(TERM_GREEN "%.1f°C\n" TERM_RESET, max30102_max_temp);
+  
+  Serial.print("Distance: ");
+  if (isnan(distance_cm)) Serial.println(TERM_RED "N/A" TERM_RESET);
+  else Serial.printf(TERM_GREEN "%.1fcm\n" TERM_RESET, distance_cm);
+  
+  Serial.println(TERM_CYAN "==========================" TERM_RESET);
+}
+
+void printSystemStatus() {
+  Serial.println("\n" TERM_CYAN "===== SYSTEM STATUS =====" TERM_RESET);
+  
+  Serial.printf("AI Mode: %s\n", aiModeEnabled ? TERM_GREEN "ON" TERM_RESET : TERM_RED "OFF" TERM_RESET);
+  Serial.printf("SU-03T Active: %s\n", su03tActive ? TERM_GREEN "YES" TERM_RESET : TERM_RED "NO" TERM_RESET);
+  Serial.printf("SU-03T Listening: %s\n", su03tListening ? TERM_GREEN "YES" TERM_RESET : TERM_RED "NO" TERM_RESET);
+  Serial.printf("SU-03T Connected: %s\n", su03tConnected ? TERM_GREEN "YES" TERM_RESET : TERM_RED "NO" TERM_RESET);
+  Serial.printf("Button Mode: %s\n", getModeName(currentButtonMode).c_str());
+  Serial.printf("Obstacle Avoidance: %s\n", obstacle_avoidance_active ? TERM_GREEN "ACTIVE" TERM_RESET : TERM_RED "INACTIVE" TERM_RESET);
+  Serial.printf("Patrol Mode: %s\n", patrolMode ? TERM_GREEN "ACTIVE" TERM_RESET : TERM_RED "INACTIVE" TERM_RESET);
+  
+  Serial.printf("Control Source: ");
+  switch (currentControlSource) {
+    case CONTROL_SOURCE_WEB:
+      Serial.println(TERM_GREEN "WEB" TERM_RESET);
+      break;
+    case CONTROL_SOURCE_VOICE_OFFLINE:
+      Serial.println(TERM_GREEN "VOICE_OFFLINE" TERM_RESET);
+      break;
+    case CONTROL_SOURCE_AI:
+      Serial.println(TERM_GREEN "AI" TERM_RESET);
+      break;
+  }
+  
+  Serial.printf("Command State: ");
+  switch (cmdContext.state) {
+    case CMD_STATE_IDLE: Serial.println(TERM_YELLOW "IDLE" TERM_RESET); break;
+    case CMD_STATE_AI_READY: Serial.println(TERM_GREEN "AI READY" TERM_RESET); break;
+    case CMD_STATE_RECORDING: Serial.println(TERM_GREEN "RECORDING" TERM_RESET); break;
+    case CMD_STATE_PROCESSING: Serial.println(TERM_YELLOW "PROCESSING" TERM_RESET); break;
+  }
+  
+  Serial.printf("Motor Speed: %d%%\n", map(currentSpeedPWM, 0, 255, 0, 100));
+  
+  Serial.println(TERM_CYAN "==========================" TERM_RESET);
+}
+
+// FIXED: Terminal input processing
+void processTerminalInput() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    
+    if (c == '\n' || c == '\r') {
+      if (cmdContext.terminalBuffer.length() > 0) {
+        processTerminalCommand(cmdContext.terminalBuffer);
+        cmdContext.terminalBuffer = "";
+      }
+      Serial.print("> ");
+    }
+    else if (c == '\b' || c == 127) {
+      if (cmdContext.terminalBuffer.length() > 0) {
+        cmdContext.terminalBuffer.remove(cmdContext.terminalBuffer.length() - 1);
+        Serial.print("\b \b");
+      }
+    }
+    else if (cmdContext.terminalBuffer.length() == 0) {
+      // Only handle single-character commands if they're NOT part of a longer command
+      if (c == 's') {
+        // Check if more characters are coming (potential multi-character command)
+        delay(10); // Small delay to see if more characters arrive
+        if (Serial.available() == 0) {
+          // No more characters, so treat as single 's' command
+          printAllSensorData();
+          Serial.print("> ");
+        } else {
+          // More characters coming, add 's' to buffer
+          cmdContext.terminalBuffer += c;
+          Serial.print(c);
+        }
+      }
+      else if (c == 'h') {
+        Serial.println("\nTerminal Commands:");
+        Serial.println("  ai on/off     - Activate/deactivate AI mode");
+        Serial.println("  su03t on/off  - Enable/disable SU-03T listening");
+        Serial.println("  ai record     - Start recording (when in AI mode)");
+        Serial.println("  tts <text>    - Test TTS with text input");
+        Serial.println("  testmic       - Test microphone functionality");
+        Serial.println("  testnet       - Test internet connection");
+        Serial.println("  sensors       - Display all sensor data");
+        Serial.println("  status        - Show current system status");
+        Serial.println("  s             - Show detailed sensor data");
+        Serial.println("  h             - Show this help message");
+        Serial.print("> ");
+      }
+      else {
+        cmdContext.terminalBuffer += c;
+        Serial.print(c);
+      }
+    }
+    else {
+      cmdContext.terminalBuffer += c;
+      Serial.print(c);
+    }
+  }
+}
+
+// UPDATED: Enhanced terminal command processing
+void processTerminalCommand(const String& command) {
+  String cmd = command;
+  cmd.trim();
+  cmd.toLowerCase();
+  
+  Serial.println("\n" TERM_CYAN "Terminal Command: " + cmd + TERM_RESET);
+  
+  if (cmd == "ai on") {
+    if (!aiModeEnabled) {
+      Serial.println(TERM_GREEN "Activating ONLINE AI MODE" TERM_RESET);
+      aiModeEnabled = true;
+      currentControlSource = CONTROL_SOURCE_AI;
+      startAiMode();
+      Serial.println(TERM_YELLOW "AI Mode is now ACTIVE. Use 'ai record' to start recording." TERM_RESET);
+    } else {
+      Serial.println("AI mode already active");
+    }
+  } 
+  else if (cmd == "ai off") {
+    if (aiModeEnabled) {
+      Serial.println(TERM_GREEN "Deactivating AI MODE" TERM_RESET);
+      aiModeEnabled = false;
+      currentControlSource = CONTROL_SOURCE_WEB;
+      exitAiMode();
+    } else {
+      Serial.println("AI mode already disabled");
+    }
+  }
+  else if (cmd == "ai record") {
+    if (aiModeEnabled) {
+      if (cmdContext.state == CMD_STATE_AI_READY) {
+        Serial.println(TERM_GREEN "Starting voice recording from terminal" TERM_RESET);
+        // Reset all recording state variables
+        audio_recording = false;
+        audio_buffer_size = 0;
+        audioRecordingStartTime = 0;
+        currentAiState = AI_RECORDING_AUDIO;
+        cmdContext.state = CMD_STATE_RECORDING;
+        displayCommandOnTFT_nonBlocking("Recording", "Speak now...", 1500);
+      } else {
+        Serial.println(TERM_YELLOW "AI is busy, cannot start recording" TERM_RESET);
+      }
+    } else {
+      Serial.println(TERM_YELLOW "AI mode not active" TERM_RESET);
+    }
+  }
+  else if (cmd == "su03t on") {
+    su03tListening = true;
+    Serial.println(TERM_GREEN "SU-03T Listening: ENABLED" TERM_RESET);
+    Serial.println("Now you can use voice commands with SU03T");
+  }
+  else if (cmd == "su03t off") {
+    su03tListening = false;
+    su03tConnected = false;
+    Serial.println(TERM_GREEN "SU-03T Listening: DISABLED" TERM_RESET);
+  }
+  else if (cmd == "su03t status") {
+    Serial.println(TERM_CYAN "SU03T Status:" TERM_RESET);
+    Serial.printf("Listening: %s\n", su03tListening ? "YES" : "NO");
+    Serial.printf("Connected: %s\n", su03tConnected ? "YES" : "NO");
+    Serial.printf("Last command: %lu ms ago\n", millis() - lastSu03tCommandTime);
+  }
+  else if (cmd.startsWith("tts ")) {
+    String text = command.substring(4);
+    if (text.length() > 0) {
+      Serial.println(TERM_GREEN "Testing TTS with text: " + text + TERM_RESET);
+      Google_TTS(text);
+    } else {
+      Serial.println(TERM_RED "Please provide text after 'tts' command" TERM_RESET);
+    }
+  }
+  else if (cmd == "testmic") {
+    testMicrophoneESP32S3();
+  }
+  else if (cmd == "testnet") {
+    testInternetConnection();
+  }
+  else if (cmd == "sensors") {
+    printAllSensorData();
+  } 
+  else if (cmd == "status") {
+    printSystemStatus();
+  }
+  else if (cmd == "debug record") {
+    debugRecordingState();
+  }
+  else if (cmd == "button modes") {
+    Serial.println(TERM_CYAN "=== BUTTON MODES ===" TERM_RESET);
+    Serial.println("Current mode: " + getModeName(currentButtonMode));
+    Serial.println("");
+    Serial.println("Mode cycle:");
+    Serial.println("1. NORMAL - Standard operation");
+    Serial.println("2. SU03T - Voice control via SU03T");
+    Serial.println("3. AI - Online AI assistant");
+    Serial.println("4. OBSTACLE - Toggle obstacle avoidance");
+    Serial.println("");
+    Serial.println("Controls:");
+    Serial.println("- Short press: Cycle to next mode");
+    Serial.println("- Long press: Emergency stop");
+    Serial.println(TERM_CYAN "====================" TERM_RESET);
+  }
+  else if (cmd == "help") {
+    Serial.println("Available terminal commands:");
+    Serial.println("  ai on/off     - Activate/deactivate AI mode");
+    Serial.println("  su03t on/off  - Enable/disable SU-03T listening");
+    Serial.println("  button modes  - Show current button mode cycling");
+    Serial.println("  tts <text>    - Test TTS with text input");
+    Serial.println("  testmic       - Test microphone functionality");
+    Serial.println("  testnet       - Test internet connection");
+    Serial.println("  sensors       - Display all sensor readings");
+    Serial.println("  status        - Show current system status");
+    Serial.println("  debug record  - Debug recording state");
+    Serial.println("  help          - Show this help message");
+    Serial.println("");
+    Serial.println("Tactile Switch Controls:");
+    Serial.println("  Short Press: Cycle through modes (Normal -> SU03T -> AI -> Obstacle)");
+    Serial.println("  Long Press: Emergency stop (disables all systems)");
+    Serial.println("  Modes:");
+    Serial.println("    Normal: Standard operation, all voice control disabled");
+    Serial.println("    SU03T: Voice control via SU03T module enabled");
+    Serial.println("    AI: Online AI voice assistant enabled");
+    Serial.println("    Obstacle: Toggle obstacle avoidance on/off");
+  } 
+  else if (cmd == "test su03t") {
+    // Test SU03T commands manually
+    Serial.println(TERM_CYAN "Testing SU03T commands..." TERM_RESET);
+    Serial.println("Send these commands to test:");
+    Serial.println("  forward  - Test forward command");
+    Serial.println("  backward - Test backward command");
+    Serial.println("  left     - Test left command");
+    Serial.println("  right    - Test right command");
+    Serial.println("  stop     - Test stop command");
+    Serial.println("  ai_start - Test AI start command");
+    Serial.println("  ai_confirm - Test AI confirm command");
+    Serial.println("  ai_exit  - Test AI exit command");
+    Serial.println("  exit     - Exit test mode");
+  }
+  else if (cmd == "forward") {
+    Serial.println(TERM_GREEN "Manual test: FORWARD" TERM_RESET);
+    motor_forward();
+  }
+  else if (cmd == "backward") {
+    Serial.println(TERM_GREEN "Manual test: BACKWARD" TERM_RESET);
+    motor_reverse();
+  }
+  else if (cmd == "left") {
+    Serial.println(TERM_GREEN "Manual test: LEFT" TERM_RESET);
+    motor_left();
+  }
+  else if (cmd == "right") {
+    Serial.println(TERM_GREEN "Manual test: RIGHT" TERM_RESET);
+    motor_right();
+  }
+  else if (cmd == "stop") {
+    Serial.println(TERM_GREEN "Manual test: STOP" TERM_RESET);
+    motor_stop();
+  }
+  else if (cmd == "ai_start") {
+    Serial.println(TERM_GREEN "Manual test: AI START" TERM_RESET);
+    processSu03tCommand(SU03T_CMD_AI_START);
+  }
+  else if (cmd == "ai_confirm") {
+    Serial.println(TERM_GREEN "Manual test: AI CONFIRM" TERM_RESET);
+    processSu03tCommand(SU03T_CMD_AI_CONFIRM);
+  }
+  else if (cmd == "ai_exit") {
+    Serial.println(TERM_GREEN "Manual test: AI EXIT" TERM_RESET);
+    processSu03tCommand(SU03T_CMD_AI_EXIT);
+  }
+  else {
+    Serial.println(TERM_RED "Unknown command. Type 'help' for available commands." TERM_RESET);
+  }
+}
+
+void printSensorDebugData() {
+  static unsigned long lastSensorDebugTime = 0;
+  static bool firstRun = true;
+  unsigned long currentMillis = millis();
+  
+  if (currentMillis - lastSensorDebugTime < 5000 && !firstRun) {
+    return;
+  }
+  
+  if (firstRun) {
+    Serial.println("\033[2J\033[H");
+    firstRun = false;
+  }
+  
+  Serial.println("\n" TERM_CYAN "===== ELLA ROBOT STATUS =====" TERM_RESET);
+  Serial.printf("Time: %lu ms | Display Mode: ", currentMillis);
+  
+  switch (currentDisplayMode) {
+    case SPLASH_SCREEN: Serial.print("SPLASH"); break;
+    case AMBIENT_SENSORS: Serial.print("AMBIENT"); break;
+    case MEDICAL_SENSORS: Serial.print("MEDICAL"); break;
+    case ROBOT_STATUS: Serial.print("ROBOT"); break;
+    case VOICE_COMMAND_DISPLAY: Serial.print("VOICE CMD"); break;
+    case AI_MODE_DISPLAY: Serial.print("AI MODE"); break;
+    case SENSOR_ALERT_DISPLAY: Serial.print("ALERT"); break;
+    case CRITICAL_ERROR_DISPLAY: Serial.print("CRITICAL ERROR"); break;
+  }
+  
+  Serial.print(" | Sensors: ");
+  Serial.print(ahtOperational ? TERM_GREEN "A" TERM_RESET : TERM_RED "A" TERM_RESET);
+  Serial.print(maxOperational ? TERM_GREEN "M" TERM_RESET : TERM_RED "M" TERM_RESET);
+  
+  Serial.print(" | AI Mode: ");
+  Serial.print(aiModeEnabled ? TERM_GREEN "ON" TERM_RESET : TERM_RED "OFF" TERM_RESET);
+  
+  Serial.print(" | SU-03T: ");
+  Serial.print(su03tListening ? TERM_GREEN "LISTENING" TERM_RESET : TERM_RED "IGNORED" TERM_RESET);
+  
+  Serial.print(" | Button: ");
+  Serial.print(getModeName(currentButtonMode).c_str());
+  
+  if (aiModeEnabled) {
+    Serial.print(" (");
+    switch (currentAiState) {
+      case AI_READY_FOR_VOICE_INPUT: Serial.print("READY"); break;
+      case AI_RECORDING_AUDIO: Serial.print("RECORDING"); break;
+      case AI_UPLOADING_AUDIO: Serial.print("UPLOADING"); break;
+      case AI_SENDING_TO_GEMINI:
+      case AI_THINKING: Serial.print("THINKING"); break;
+      case AI_GETTING_TTS: Serial.print("GETTING TTS"); break;
+      case AI_PLAYING_TTS:
+      case AI_SPEAKING: Serial.print("SPEAKING"); break;
+      case AI_RESTARTING_CIRCLE: Serial.print("RESTARTING"); break;
+      default: Serial.print("IDLE");
+    }
+    Serial.print(")");
+  }
+  
+  Serial.println("\n" TERM_CYAN "===== SENSOR READINGS =====" TERM_RESET);
+  
+  Serial.print("Temperature: ");
+  if (!ahtOperational) Serial.println(TERM_RED "SENSOR OFFLINE" TERM_RESET);
+  else if (isnan(temp_aht)) Serial.println(TERM_RED "N/A" TERM_RESET);
+  else Serial.printf(TERM_GREEN "%.1f°C" TERM_RESET, temp_aht);
+  
+  Serial.print("Humidity: ");
+  if (!ahtOperational) Serial.println(TERM_RED "SENSOR OFFLINE" TERM_RESET);
+  else if (isnan(humidity_aht)) Serial.println(TERM_RED "N/A" TERM_RESET);
+  else Serial.printf(TERM_GREEN "%.1f%%" TERM_RESET, humidity_aht);
+  
+  Serial.print("Heart Rate: ");
+  if (!maxOperational) Serial.println(TERM_RED "SENSOR OFFLINE" TERM_RESET);
+  else if (isnan(max30102_hr) || max30102_hr <= 0) Serial.println(TERM_RED "N/A" TERM_RESET);
+  else Serial.printf(TERM_GREEN "%.0f BPM" TERM_RESET, max30102_hr);
+  
+  Serial.print("SpO2: ");
+  if (!maxOperational) Serial.println(TERM_RED "SENSOR OFFLINE" TERM_RESET);
+  else if (isnan(max30102_spo2) || max30102_spo2 <= 0) Serial.println(TERM_RED "N/A" TERM_RESET);
+  else Serial.printf(TERM_GREEN "%.1f%%" TERM_RESET, max30102_spo2);
+  
+  Serial.print("Finger Temp: ");
+  if (!maxOperational) Serial.println(TERM_RED "SENSOR OFFLINE" TERM_RESET);
+  else if (isnan(max30102_max_temp)) Serial.println(TERM_RED "N/A" TERM_RESET);
+  else Serial.printf(TERM_GREEN "%.1f°C" TERM_RESET, max30102_max_temp);
+  
+  Serial.print("Distance: ");
+  if (isnan(distance_cm)) Serial.println(TERM_RED "N/A" TERM_RESET);
+  else Serial.printf(TERM_GREEN "%.1fcm" TERM_RESET, distance_cm);
+  
+  Serial.print("Obstacle Avoidance: ");
+  Serial.println(obstacle_avoidance_active ? TERM_GREEN "ACTIVE" TERM_RESET : TERM_RED "INACTIVE" TERM_RESET);
+  
+  Serial.print("Patrol Mode: ");
+  Serial.println(patrolMode ? TERM_GREEN "ACTIVE" TERM_RESET : TERM_RED "INACTIVE" TERM_RESET);
+  
+  Serial.println(TERM_CYAN "Press 's' for detailed sensor data, 'h' for help" TERM_RESET);
+  Serial.println(TERM_CYAN "========================================" TERM_RESET);
+  
+  lastSensorDebugTime = currentMillis;
+}
+
+bool testInternetConnection() {
+  Serial.println(TERM_CYAN "=== TESTING INTERNET CONNECTION ===" TERM_RESET);
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println(TERM_RED "WiFi not connected" TERM_RESET);
+    return false;
+  }
+  
+  Serial.printf(TERM_GREEN "WiFi connected. IP: %s" TERM_RESET, WiFi.localIP().toString().c_str());
+  
+  WiFiClient testClient;
+  if (!testClient.connect("8.8.8.8", 53)) {
+    Serial.println(TERM_RED "Cannot connect to internet (DNS test failed)" TERM_RESET);
+    return false;
+  }
+  testClient.stop();
+  
+  Serial.println(TERM_GREEN "Internet connection test PASSED" TERM_RESET);
+  Serial.println(TERM_CYAN "====================================" TERM_RESET);
+  
+  return true;
+}
+
+void testMicrophoneESP32S3() {
+  Serial.println(TERM_CYAN "=== ESP32-S3 MICROPHONE TEST ===" TERM_RESET);
+  
+  // Initialize I2S if not already initialized
+  if (!I2S_Record_Init()) {
+    Serial.println(TERM_RED "Failed to initialize I2S for microphone test" TERM_RESET);
+    return;
+  }
+  
+  Serial.println(TERM_CYAN "Recording for 5 seconds..." TERM_RESET);
+  
+  audio_recording = true;
+  audio_buffer_size = 0;
+  unsigned long startTime = millis();
+  
+  while (millis() - startTime < 5000) {
+    if (!Record_Continue()) {
+      break;
+    }
+    delay(1);
+  }
+  
+  audio_recording = false;
+  
+  analyzeAudio();
+  
+  Serial.println(TERM_CYAN "===================================" TERM_RESET);
+}
+
+// AI PROCESSING FUNCTIONS
+void startAiMode() {
+  Serial.println(TERM_GREEN "Online AI: Activating..." TERM_RESET);
+  
+  currentAiState = AI_READY_FOR_VOICE_INPUT;
+  aiStateStartTime = millis();
+  aiDisplayStatusUpdateNeeded = true;
+  cmdContext.state = CMD_STATE_AI_READY;
+  
+  // Force display mode change
+  currentDisplayMode = AI_MODE_DISPLAY;
+  lastDrawnMode = (DisplayMode)-1; // Force redraw
+  
+  Serial.println(TERM_GREEN "AI mode activated successfully" TERM_RESET);
+}
+
+void exitAiMode() {
+  Serial.println(TERM_YELLOW "Online AI: Deactivated." TERM_RESET);
+  
+  currentAiState = AI_IDLE;
+  cmdContext.state = CMD_STATE_IDLE;
+  
+  // Clean up audio buffer
+  if (audio_buffer != NULL) {
+    free(audio_buffer);
+    audio_buffer = NULL;
+    audio_buffer_size = 0;
+    Serial.println(TERM_GREEN "Recording buffer cleared" TERM_RESET);
+  }
+  
+  // Clean up I2S
+  if (rx_handle != NULL) {
+    i2s_channel_disable(rx_handle);
+    i2s_del_channel(rx_handle);
+    rx_handle = NULL;
+  }
+  
+  set_primary_display();
+}
+
+void restartAICircle() {
+  Serial.println(TERM_CYAN "Restarting AI circle..." TERM_RESET);
+  
+  if (isPlayingAudio) {
+    audio_play.connecttohost("");
+    isPlayingAudio = false;
+  }
+  
+  // Reset audio recording state
+  audio_recording = false;
+  audioRecordingStartTime = 0;
+  
+  // Don't free the audio buffer, just reset it for reuse
+  if (audio_buffer != NULL) {
+    audio_buffer_size = 0;
+    Serial.println(TERM_GREEN "Recording buffer reset" TERM_RESET);
+  }
+  
+  currentAiState = AI_READY_FOR_VOICE_INPUT;
+  aiStateStartTime = millis();
+  aiDisplayStatusUpdateNeeded = true;
+  
+  cmdContext.state = CMD_STATE_AI_READY;
+  
+  currentDisplayMode = AI_MODE_DISPLAY;
+  
+  Serial.println(TERM_GREEN "AI circle restarted, ready for new input" TERM_RESET);
+}
+
+// WEB SERVER FUNCTIONS
+void setup_web_server() {
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
+  
+  if (!LittleFS.begin(true)){
+    Serial.println(TERM_RED "[FS] LittleFS Mount Failed!" TERM_RESET);
+    displayCriticalError("LittleFS Failed!", false);
+    while(1) delay(1000);
+  }
+  
+  Serial.println("LittleFS Mounted.");
+  
+  if (!LittleFS.exists(WEB_ROOT)) {
+    Serial.println("Creating web directory");
+    LittleFS.mkdir(WEB_ROOT);
+  }
+  
+  server.on("/forward", HTTP_GET, [](AsyncWebServerRequest *request) {
+    Serial.println("Web Command: /forward");
+    motor_forward(); 
+    request->send(200, "application/json", "{\"status\": \"OK\"}");
+  });
+  
+  server.on("/reverse", HTTP_GET, [](AsyncWebServerRequest *request) {
+    Serial.println("Web Command: /reverse");
+    motor_reverse(); 
+    request->send(200, "application/json", "{\"status\": \"OK\"}");
+  });
+  
+  server.on("/left", HTTP_GET, [](AsyncWebServerRequest *request) {
+    Serial.println("Web Command: /left");
+    motor_left(); 
+    request->send(200, "application/json", "{\"status\": \"OK\"}");
+  });
+  
+  server.on("/right", HTTP_GET, [](AsyncWebServerRequest *request) {
+    Serial.println("Web Command: /right");
+    motor_right(); 
+    request->send(200, "application/json", "{\"status\": \"OK\"}");
+  });
+  
+  server.on("/stop", HTTP_GET, [](AsyncWebServerRequest *request) {
+    Serial.println("Web Command: /stop");
+    motor_stop(); 
+    request->send(200, "application/json", "{\"status\": \"OK\"}");
+  });
+  
+  server.on("/obstacle_avoidance", HTTP_GET, [](AsyncWebServerRequest *request) {
+    Serial.println("Web Command: Toggle Patrol Mode");
+    
+    patrolMode = !patrolMode;
+    
+    if (patrolMode) {
+       Serial.println("Patrol: ON");
+       // Disable the standard safety brake so Patrol allows the robot to move freely
+       obstacle_avoidance_active = false; 
+    } else {
+       Serial.println("Patrol: OFF");
+       motor_stop(); 
+       // CRITICAL: Re-enable the safety brake so manual driving is safe again
+       obstacle_avoidance_active = true; 
+    }
+    
+    // Send status back to phone (Green = Patrol ON)
+    request->send(200, "application/json", 
+      String("{\"obstacle_avoidance_active\":") + (patrolMode ? "true" : "false") + "}");
+  });
+  
+  server.on("/su03t_listening", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (request->hasParam("state")) {
+      String state = request->getParam("state")->value();
+      Serial.printf("Web Command: /su03t_listening state=%s\n", state.c_str());
+      
+      if (state == "on") {
+        su03tListening = true;
+        Serial.println("SU-03T Listening: ENABLED");
+      } else if (state == "off") {
+        su03tListening = false;
+        su03tConnected = false;
+        Serial.println("SU-03T Listening: DISABLED");
+      } else {
+        request->send(400, "application/json", "{\"error\": \"Invalid state parameter\"}");
+        return;
+      }
+      
+      request->send(200, "application/json", String("{\"su03tListening\":") + (su03tListening ? "true" : "false") + "}");
+    } else {
+      request->send(400, "application/json", "{\"error\": \"Missing 'state' parameter\"}");
+    }
+  });
+  
+  server.on("/speed", HTTP_GET, [](AsyncWebServerRequest *request) {
+    Serial.println("Web Command: /speed");
+    if (request->hasParam("value")) {
+      int value = request->getParam("value")->value().toInt();
+      Serial.printf("Web Command: /speed value=%d\n", value);
+      currentSpeedPWM = map(value, 0, 100, 0, 255);
+      request->send(200, "application/json", String("{\"speed\":") + value + "}");
+    } else {
+      Serial.println("Web Command: /speed (invalid)");
+      request->send(400, "application/json", "{\"error\": \"Missing speed value\"}");
+    }
+  });
+  
+  server.on("/sensordata", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String json = "{";
+    json += "\"temp_aht\":" + (isnan(temp_aht) ? "null" : String(temp_aht, 1)) + ",";
+    json += "\"humidity_aht\":" + (isnan(humidity_aht) ? "null" : String(humidity_aht, 1)) + ",";
+    json += "\"hr\":" + (isnan(max30102_hr) ? "null" : String(max30102_hr, 0)) + ",";
+    json += "\"spo2\":" + (isnan(max30102_spo2) ? "null" : String(max30102_spo2, 1)) + ",";
+    json += "\"distance\":" + (isnan(distance_cm) ? "null" : String(distance_cm, 1)) + ",";
+    json += "\"obstacle_avoidance_active\":" + String(obstacle_avoidance_active ? "true" : "false") + ",";
+    json += "\"patrolMode\":" + String(patrolMode ? "true" : "false");
+    json += "}";
+    
+    request->send(200, "application/json", json);
+  });
+  
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    Serial.println("Web Command: / (root)");
+    
+    String indexPath = String(WEB_ROOT) + "index.html";
+    if (LittleFS.exists(indexPath)) {
+      request->send(LittleFS, indexPath, "text/html");
+      return;
+    }
+    
+    indexPath = "/index.html";
+    if (LittleFS.exists(indexPath)) {
+      request->send(LittleFS, indexPath, "text/html");
+      return;
+    }
+    
+    request->send(404, "text/plain", "index.html not found. Please upload it to the web directory.");
+  });
+  
+  server.on("/files", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String json = "[";
+    File root = LittleFS.open(WEB_ROOT);
+    if (root) {
+      File file = root.openNextFile();
+      while (file) {
+        if (json.length() > 1) json += ",";
+        json += "{\"name\":\"" + String(file.name()).substring(1) + "\",\"size\":" + String(file.size()) + "}";
+        file.close();
+        file = root.openNextFile();
+      }
+      root.close();
+    }
+    json += "]";
+    request->send(200, "application/json", json);
+  });
+  
+  server.on("/fsinfo", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String json = "{";
+    if (LittleFS.totalBytes() > 0) {
+      json += "\"totalBytes\":" + String(LittleFS.totalBytes()) + ",";
+      json += "\"usedBytes\":" + String(LittleFS.usedBytes()) + ",";
+      json += "\"freeBytes\":" + String(LittleFS.totalBytes() - LittleFS.usedBytes());
+    } else {
+      json += "\"error\":\"Failed to get FS info\"";
+    }
+    json += "}";
+    request->send(200, "application/json", json);
+  });
+  
+  server.begin();
+  isWebServerRunning = true;
+  Serial.println(TERM_GREEN "Web server started" TERM_RESET);
+}
+
+void checkFileSystemUsage() {
+  if (LittleFS.totalBytes() > 0) {
+    Serial.println(TERM_CYAN "=== FILE SYSTEM INFO ===" TERM_RESET);
+    Serial.printf("Total space: %10u bytes\n", LittleFS.totalBytes());
+    Serial.printf("Used space:  %10u bytes\n", LittleFS.usedBytes());
+    Serial.printf("Free space:  %10u bytes (%.1f%%)\n", 
+                 LittleFS.totalBytes() - LittleFS.usedBytes(),
+                 (float)(LittleFS.totalBytes() - LittleFS.usedBytes()) / LittleFS.totalBytes() * 100);
+    
+    File webDir = LittleFS.open(WEB_ROOT);
+    if (webDir) {
+      int webFileCount = 0;
+      unsigned long webFileSize = 0;
+      File file = webDir.openNextFile();
+      while (file) {
+        webFileCount++;
+        webFileSize += file.size();
+        file.close();
+        file = webDir.openNextFile();
+      }
+      webDir.close();
+      Serial.printf("Web directory: %d files, %lu bytes\n", webFileCount, webFileSize);
+    }
+    
+    Serial.println(TERM_CYAN "==========================" TERM_RESET);
+  }
+}
+
+void handleOfflineCommand(uint8_t command) {
+  processSu03tCommand(command);
+}
+
+void displayCommandOnTFT_nonBlocking(String title, String detail, unsigned long duration) {
+  currentDisplayMode = VOICE_COMMAND_DISPLAY;
+  voiceCommandDisplayEndTime = millis() + duration;
+}
+
+void monitor_system_memory() {
+  static unsigned long lastMemoryCheck = 0;
+  
+  if (millis() - lastMemoryCheck > 5000) {
+    Serial.printf(TERM_CYAN "Memory Monitor - Free heap: %d, Min free: %d" TERM_RESET, 
+                 ESP.getFreeHeap(), ESP.getMinFreeHeap());
+    
+    if (ESP.getMinFreeHeap() < 20000) {
+      Serial.println(TERM_YELLOW "WARNING: Low memory detected - initiating cleanup" TERM_RESET);
+      cleanup_unused_buffers();
+    }
+    
+    lastMemoryCheck = millis();
+  }
+}
+
+void cleanup_unused_buffers() {
+  Serial.println(TERM_CYAN "Cleaning up unused buffers..." TERM_RESET);
+  
+  if (!audio_recording && audio_buffer != NULL) {
+    free(audio_buffer);
+    audio_buffer = NULL;
+    audio_buffer_size = 0;
+    Serial.println(TERM_GREEN "Freed recording buffer" TERM_RESET);
+  }
+  
+  Serial.println(TERM_GREEN "Buffer cleanup complete" TERM_RESET);
+}
+
+// Obstacle avoidance as background process - FIXED to work in all directions
+void checkObstacleAvoidance() {
+  // Skip obstacle avoidance in AI mode (motors disabled)
+  if (aiModeEnabled) {
+    return;
+  }
+  
+  // Skip if obstacle avoidance is disabled
+  if (!obstacle_avoidance_active) {
+    return;
+  }
+
+  // If we're currently evading an obstacle
+  if (isEvading) {
+    if (millis() - evadingStartTime >= OBSTACLE_EVASION_DURATION) {
+      motor_stop();
+      isEvading = false;
+      Serial.println("Obstacle avoidance: Evasion complete");
+    }
+    return;
+  }
+
+  // Check for obstacles in ANY movement state (not just forward)
+  if (currentMovement != MOVEMENT_STOPPED) {
+    float currentDistance = getDistance();
+    
+    if (!isnan(currentDistance) && currentDistance < OBSTACLE_DISTANCE_THRESHOLD) {
+      Serial.printf("Obstacle detected at %.1f cm! Starting evasion...\n", currentDistance);
+      
+      // Stop immediately regardless of current movement direction
+      motor_stop();
+      delay(50); // Brief pause
+      
+      // Start evasive maneuver (move backward)
+      isEvading = true;
+      evadingStartTime = millis();
+      motor_reverse();
+    }
+  }
+}
+
+// PATROL MODE - Autonomous exploration with cinematic movement
+void runPatrolLogic() {
+  // Only run if Patrol is ON and AI is OFF
+  if (!patrolMode || aiModeEnabled) return;
+
+  float dist = getDistance();
+  
+  // === OBSTACLE DETECTED (< 35cm) ===
+  if (!isnan(dist) && dist > 0 && dist < 35.0) {
+    Serial.println("Patrol: Wall detected! Evasive maneuvers.");
+    
+    // 1. Stop gently
+    motor_stop();
+    delay(200);
+    
+    // 2. Back up fast (Manual write to skip ramp for reaction speed)
+    digitalWrite(MOT_A1_PIN, LOW); ledcWrite(MOT_A2_PIN, 180);
+    digitalWrite(MOT_B1_PIN, LOW); ledcWrite(MOT_B2_PIN, 180);
+    delay(500); 
+    
+    // 3. Spin Turn (Random Left or Right)
+    if (random(0, 2) == 0) {
+       motor_left(); // Spin Left
+    } else {
+       motor_right(); // Spin Right
+    }
+    delay(600); 
+    
+    // 4. Stop before continuing
+    motor_stop();
+    delay(200);
+    
+  } else {
+    // === PATH CLEAR ===
+    // If we aren't moving, start moving forward automatically
+    if (currentMovement != MOVEMENT_FORWARD) {
+       motor_forward();
+    }
+  }
+}
+
+void setup_speaker_i2s() {
+  Serial.println(TERM_CYAN "Setting up I2S for speaker..." TERM_RESET);
+  
+  audio_play.setPinout(I2S_SPEAKER_BCK, I2S_SPEAKER_WS, I2S_SPEAKER_DATA);
+  
+  // Maximum software volume settings
+  audio_play.setVolumeSteps(63);    // Full range (0-63)
+  audio_play.setVolume(63);         // Maximum volume
+  audio_play.setTone(6, 6, 6);      // Maximum tone boost
+  
+  Serial.println(TERM_GREEN "Speaker I2S setup complete" TERM_RESET);
+  Serial.println(TERM_GREEN "Hardware: 15dB gain (100KΩ GAIN-GND)" TERM_RESET);
+  Serial.println(TERM_GREEN "Software: Volume 63/63, Tone +6dB" TERM_RESET);
+}
+
+// Tactile switch processing function - FIXED to keep SU03T active in normal mode
+void processTactileSwitch() {
+  int reading = digitalRead(TACTILE_SWITCH_PIN);
+  
+  // If the switch changed, due to noise or pressing:
+  if (reading != lastButtonState) {
+    lastDebounceTime = millis();
+  }
+  
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    // Whatever the reading is at, it's been there for longer than the debounce
+    // delay, so take it as the actual current state:
+    
+    // If the button state has changed:
+    if (reading != buttonState) {
+      buttonState = reading;
+      
+      if (buttonState == LOW) {
+        // Button is pressed (active low because of pull-up)
+        buttonPressStartTime = millis();
+      } else {
+        // Button is released
+        unsigned long pressDuration = millis() - buttonPressStartTime;
+        
+        if (pressDuration < LONG_PRESS_TIME) {
+          // Short press - cycle through modes
+          currentButtonMode = (ButtonMode)((currentButtonMode + 1) % MODE_COUNT);
+          
+          // Apply the new mode
+          switch (currentButtonMode) {
+            case MODE_NORMAL:
+              // Keep SU03T active in normal mode for AI mode entry
+              su03tListening = true;  // SU03T remains active
+              aiModeEnabled = false;   // Disable AI mode
+              obstacle_avoidance_active = true;  // Enable obstacle avoidance
+              patrolMode = false;     // Disable patrol mode
+              Serial.println(TERM_GREEN "Button: NORMAL MODE (Motors & SU03T Enabled)" TERM_RESET);
+              break;
+              
+            case MODE_SU03T:
+              su03tListening = true;
+              aiModeEnabled = false;
+              Serial.println(TERM_GREEN "Button: SU03T MODE ENABLED" TERM_RESET);
+              break;
+              
+            case MODE_AI:
+              su03tListening = true;  // Keep SU03T active to exit AI mode
+              aiModeEnabled = true;
+              startAiMode();
+              Serial.println(TERM_GREEN "Button: AI MODE ENABLED (Motors Disabled)" TERM_RESET);
+              break;
+              
+            case MODE_OBSTACLE:
+              obstacle_avoidance_active = !obstacle_avoidance_active;
+              Serial.printf(TERM_GREEN "Button: OBSTACLE AVOIDANCE %s" TERM_RESET, 
+                   obstacle_avoidance_active ? "ENABLED" : "DISABLED");
+              break;
+              
+            case MODE_COUNT:
+              // Shouldn't happen due to modulo
+              break;
+          }
+          
+          // Update display to show mode change
+          displayCommandOnTFT_nonBlocking("Mode Changed", getModeName(currentButtonMode), 2000);
+        }
+      }
+    }
+  }
+  
+  // Check for long press while button is still pressed
+  if (buttonState == LOW && (millis() - buttonPressStartTime) >= LONG_PRESS_TIME) {
+    // Long press action - emergency stop
+    motor_stop();
+    su03tListening = true;  // Keep SU03T active after emergency stop
+    aiModeEnabled = false;
+    currentButtonMode = MODE_NORMAL;
+    obstacle_avoidance_active = true;
+    patrolMode = false;
+    
+    Serial.println(TERM_RED "Button: EMERGENCY STOP (Long Press)" TERM_RESET);
+    displayCommandOnTFT_nonBlocking("EMERGENCY STOP", "All systems reset", 3000);
+    
+    // Wait for button release to avoid multiple triggers
+    while (digitalRead(TACTILE_SWITCH_PIN) == LOW) {
+      delay(10);
+    }
+  }
+  
+  // Save the reading. Next time through the loop, it'll be the lastButtonState:
+  lastButtonState = reading;
+}
+
+// FIXED: Enhanced display update logic for AI states
+void update_tft_display() {
+  if (!tftOperational) return;
+  
+  unsigned long currentMillis = millis();
+  
+  // CRITICAL FIX: Force AI mode display when AI is enabled
+  if (aiModeEnabled) {
+    if (currentDisplayMode != AI_MODE_DISPLAY && 
+        currentDisplayMode != VOICE_COMMAND_DISPLAY) {
+      currentDisplayMode = AI_MODE_DISPLAY;
+      lastDrawnMode = (DisplayMode)-1; // Force redraw
+      Serial.println(TERM_CYAN "Forcing display mode to AI_MODE_DISPLAY" TERM_RESET);
+    }
+    
+    // Additional check to ensure we return to AI mode after voice commands
+    if (currentDisplayMode == VOICE_COMMAND_DISPLAY && 
+        millis() >= voiceCommandDisplayEndTime) {
+      currentDisplayMode = AI_MODE_DISPLAY;
+      lastDrawnMode = (DisplayMode)-1; // Force redraw
+      Serial.println(TERM_CYAN "Returning to AI_MODE_DISPLAY after voice command" TERM_RESET);
+    }
+  }
+  
+  // Check if we need to redraw the AI screen due to state change
+  if (aiModeEnabled && currentDisplayMode == AI_MODE_DISPLAY) {
+    if (lastAiState != currentAiState || lastAiModeEnabled != aiModeEnabled || aiDisplayStatusUpdateNeeded) {
+      lastDrawnMode = (DisplayMode)-1; // Force redraw
+      lastAiState = currentAiState;
+      lastAiModeEnabled = aiModeEnabled;
+      aiDisplayStatusUpdateNeeded = false;
+      Serial.println(TERM_CYAN "AI display state changed, forcing redraw" TERM_RESET);
+    }
+  }
+  
+  // Check if we need to redraw the screen
+  if (currentDisplayMode != lastDrawnMode) {
+    Serial.printf(TERM_CYAN "Display mode changed from %d to %d" TERM_RESET, lastDrawnMode, currentDisplayMode);
+    
+    switch (currentDisplayMode) {
+      case SPLASH_SCREEN: 
+        drawSplashScreen(); 
+        break;
+      case AMBIENT_SENSORS: 
+        drawAmbientSensorScreen(); 
+        break;
+      case MEDICAL_SENSORS: 
+        if (max30102State != MAX30102_FINGER_DETECTED && max30102State != MAX30102_READING_HR_SPO2) {
+          drawMedicalSensorScreen();
+        }
+        break;
+      case ROBOT_STATUS: 
+        drawRobotStatusScreen(); 
+        break;
+      case VOICE_COMMAND_DISPLAY: 
+        drawVoiceCommandDisplay("Voice Command", "Processing..."); 
+        break;
+      case AI_MODE_DISPLAY: 
+        drawAiModeScreen(); 
+        break;
+      case SENSOR_ALERT_DISPLAY: 
+        switch (currentAlertType) {
+          case TEMP_ALERT: 
+            drawSensorAlertScreen("Temperature Alert", (temp_aht < TEMP_COLD_THRESHOLD) ? "Device is Too Cold!" : "Device is Too Hot!");
+            break;
+          case HUMIDITY_ALERT: 
+            drawSensorAlertScreen("Humidity Alert", (humidity_aht < HUMIDITY_DRY_THRESHOLD) ? "Air is Too Dry!" : "Air is Too Humid!");
+            break;
+          default: 
+            set_primary_display();
+            break;
+        }
+        break;
+      case CRITICAL_ERROR_DISPLAY: 
+        break;
+    }
+    
+    lastDrawnMode = currentDisplayMode;
+  }
+  
+  // FIXED: Enhanced voice command display timeout handling
+  if (currentDisplayMode == VOICE_COMMAND_DISPLAY && 
+      voiceCommandDisplayEndTime > 0 && 
+      currentMillis >= voiceCommandDisplayEndTime) {
+    Serial.println(TERM_CYAN "Voice command display timeout, returning to primary display" TERM_RESET);
+    set_primary_display();
+    voiceCommandDisplayEndTime = 0; // Reset the timer
+  }
+  
+  if (currentDisplayMode == MEDICAL_SENSORS) {
+    bool enteringMeasuringState = (max30102State == MAX30102_FINGER_DETECTED || max30102State == MAX30102_READING_HR_SPO2) &&
+                                   (lastMax30102State != MAX30102_FINGER_DETECTED && lastMax30102State != MAX30102_READING_HR_SPO2);
+    
+    if (enteringMeasuringState) {
+      tft.fillScreen(UI_BG);
+      drawCard(0, 0, 128, 16, UI_CARD_BG);
+      tft.setTextColor(UI_TEXT_MAIN);
+      tft.setTextSize(1);
+      tft.setCursor(5, 5);
+      tft.print("MEASURING");
+      
+      tft.setTextColor(UI_ACCENT);
+      tft.setTextSize(1);
+      tft.setCursor(30, 40);
+      tft.print("Measuring");
+      
+      lastDisplayUpdateTime = currentMillis;
+      lastMax30102State = max30102State;
+      return;
+    }
+    
+    lastMax30102State = max30102State;
+    
+    if (max30102State == MAX30102_FINGER_DETECTED || max30102State == MAX30102_READING_HR_SPO2) {
+      static int dotCount = 0;
+      static unsigned long lastDotUpdate = 0;
+      
+      if (currentMillis - lastDotUpdate >= 500) {
+        dotCount = (dotCount + 1) % 4;
+        lastDotUpdate = currentMillis;
+      }
+      
+      tft.setCursor(30, 55);
+      for (int i = 0; i < 3; i++) {
+        if (i < dotCount) {
+          tft.print(".");
+        } else {
+          tft.print(" ");
+        }
+      }
+      
+      unsigned long elapsed = millis() - max30102_finger_detection_start;
+      if (elapsed < MAX30102_FINGER_DETECTION_HOLD_MS) {
+        int secondsRemaining = (MAX30102_FINGER_DETECTION_HOLD_MS - elapsed) / 1000 + 1;
+        drawCard(5, 75, 120, 15, UI_CARD_BG);
+        tft.setCursor(5, 75);
+        tft.print("Starting in: ");
+        tft.print(secondsRemaining);
+        tft.print("s");
+      } else {
+        int progress = (max30102_buffer_index * 100) / MAX30102_BUFFER_SIZE;
+        drawCard(5, 75, 120, 15, UI_CARD_BG);
+        tft.setCursor(5, 75);
+        tft.print("Progress: ");
+        tft.print(progress);
+        tft.print("%");
+      }
+      
+      tft.fillRect(5, 115, 8, 8, maxOperational ? UI_ACCENT : UI_ALERT);
+      tft.setCursor(18, 115);
+      tft.setTextColor(UI_ACCENT);
+      tft.setTextSize(1);
+      tft.print("MAX");
+      
+      // Add WiFi indicator
+      drawWiFiIndicator(45, 115);
+      
+      lastDisplayUpdateTime = currentMillis;
+      return;
+    }
+  }
+  
+  if (currentMillis - lastSensorValueUpdate >= 500) {
+    lastSensorValueUpdate = currentMillis;
+    
+    switch (currentDisplayMode) {
+      case AMBIENT_SENSORS:
+        drawCard(5, 40, 120, 20, UI_CARD_BG);
+        tft.setCursor(10, 42);
+        if (!isnan(temp_aht) && ahtOperational) {
+          tft.setTextColor(UI_TEXT_MAIN);
+          if (temp_aht < 10.0 || temp_aht > 50.0) {
+            tft.setTextColor(UI_ALERT);
+          }
+          tft.setTextSize(3);
+          tft.print(temp_aht, 1);
+          tft.setTextSize(1);
+          tft.print(" C");
+        } else {
+          tft.setTextColor(UI_TEXT_SUB);
+          tft.setTextSize(2);
+          tft.print("N/A");
+        }
+        
+        drawCard(5, 80, 100, 20, UI_CARD_BG);
+        tft.setCursor(10, 82);
+        if (!isnan(humidity_aht) && ahtOperational) {
+          tft.setTextColor(UI_TEXT_MAIN);
+          if (humidity_aht < 20.0 || humidity_aht > 120.0) {
+            tft.setTextColor(UI_ALERT);
+          }
+          tft.setTextSize(3);
+          tft.print(humidity_aht, 0);
+          tft.setTextSize(1);
+          tft.print(" %");
+        } else {
+          tft.setTextColor(UI_TEXT_SUB);
+          tft.setTextSize(2);
+          tft.print("N/A");
+        }
+        break;
+        
+      case MEDICAL_SENSORS:
+        if (max30102State == MAX30102_DISPLAY_RESULTS) {
+          drawCard(5, 40, 60, 20, UI_CARD_BG);
+          tft.setCursor(10, 42);
+          if (!isnan(max30102_hr) && maxOperational && max30102_hr > 0) {
+            tft.setTextColor(UI_TEXT_MAIN);
+            if (max30102_hr < 40.0 || max30102_hr > 120.0) {
+              tft.setTextColor(UI_ALERT);
+            }
+            tft.setTextSize(2);
+            tft.print(max30102_hr, 0);
+            tft.setTextSize(1);
+            tft.print("BPM");
+          } else {
+            tft.setTextColor(UI_TEXT_SUB);
+            tft.setTextSize(2);
+            tft.print("N/A");
+          }
+          
+          drawCard(70, 40, 50, 20, UI_CARD_BG);
+          tft.setCursor(75, 42);
+          if (!isnan(max30102_spo2) && maxOperational && max30102_spo2 > 0) {
+            tft.setTextColor(UI_TEXT_MAIN);
+            if (max30102_spo2 < 90.0) {
+              tft.setTextColor(UI_ALERT);
+            }
+            tft.setTextSize(2);
+            tft.print(max30102_spo2, 0);
+            tft.setTextSize(1);
+            tft.print("%");
+          } else {
+            tft.setTextColor(UI_TEXT_SUB);
+            tft.setTextSize(2);
+            tft.print("N/A");
+          }
+          
+          drawCard(5, 80, 120, 20, UI_CARD_BG);
+          tft.setCursor(10, 82);
+          if (!isnan(max30102_max_temp) && maxOperational) {
+            tft.setTextColor(UI_TEXT_MAIN);
+            if (max30102_max_temp < 35.0 || max30102_max_temp > 38.0) {
+              tft.setTextColor(UI_ALERT);
+            }
+            tft.setTextSize(2);
+            tft.print(max30102_max_temp, 1);
+            tft.setTextSize(1);
+            tft.print("C");
+          } else {
+            tft.setTextColor(UI_TEXT_SUB);
+            tft.setTextSize(2);
+            tft.print("N/A");
+          }
+        }
+        break;
+        
+      case ROBOT_STATUS:
+        drawCard(5, 40, 100, 20, UI_CARD_BG);
+        tft.setCursor(10, 42);
+        if (!isnan(distance_cm)) {
+          tft.setTextColor(UI_TEXT_MAIN);
+          if (distance_cm < 20.0) {
+            tft.setTextColor(UI_ALERT);
+          }
+          tft.setTextSize(3);
+          tft.print(distance_cm, 1);
+          tft.setTextSize(1);
+          tft.print("cm");
+        } else {
+          tft.setTextColor(UI_TEXT_SUB);
+          tft.setTextSize(2);
+          tft.print("N/A");
+        }
+        
+        drawCard(5, 80, 50, 20, UI_CARD_BG);
+        tft.setCursor(10, 82);
+        if (su03tListening) {
+          tft.setTextColor(UI_ACCENT);
+          tft.setTextSize(2);
+          tft.print("ON");
+        } else {
+          tft.setTextColor(UI_TEXT_SUB);
+          tft.setTextSize(2);
+          tft.print("OFF");
+        }
+        break;
+    }
+  }
+  
+  // Draw current mode indicator
+  drawCurrentMode();
+  
+  lastDisplayUpdateTime = currentMillis;
+}
+
+// FIXED: Modified set_primary_display to not interfere with AI mode
+void set_primary_display() {
+  if (aiModeEnabled) {
+    currentDisplayMode = AI_MODE_DISPLAY;  // Explicitly set to AI mode when enabled
+  } else {
+    currentDisplayMode = AMBIENT_SENSORS;
+  }
+}
+
+// SETUP & LOOP - FIXED: Enhanced initialization
+void setup() {
+  // 1. Hardware Settings
+  analogSetAttenuation(ADC_11db);
+  analogReadResolution(12);
+  
+  initCommandSystem();
+  
+  Serial.begin(115200);
+  while (!Serial) delay(10);
+  Serial.println("\n" TERM_GREEN "Ella Robot Assistant - Starting Up" TERM_RESET);
+  
+  // 2. Pin Modes
+  pinMode(US_TRIG_PIN, OUTPUT);
+  pinMode(US_ECHO_PIN, INPUT);
+  
+  // Interrupt for faster ultrasonic (Optional - we discussed this upgrade)
+  // attachInterrupt(digitalPinToInterrupt(US_ECHO_PIN), sonar_isr, CHANGE); 
+  
+  pinMode(pin_BOOT_BTN, INPUT_PULLUP);
+  pinMode(TACTILE_SWITCH_PIN, INPUT_PULLUP);
+  
+  // 3. Display Initialization
+  tft.initR(INITR_BLACKTAB);
+  tft.setRotation(0); // 0 = Portrait, 1 = Landscape
+  tftOperational = true;
+  drawSplashScreen(); // Show the new Logo
+  
+  // 4. Audio & Sensors
+  setup_speaker_i2s();
+  initialize_i2c_sensors();
+  
+  // 5. WiFi Setup
+  WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+    switch (event) {
+      case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+        Serial.println("WiFi: Connected to AP.");
+        break;
+      case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+        Serial.print("WiFi: IP Address: ");
+        Serial.println(WiFi.localIP());
+        wifiConnected = true;
+        
+        if (!MDNS.begin("ella")) {
+          Serial.println("mDNS: Failed.");
+        } else {
+          Serial.println("mDNS: Started at http://ella.local");
+          MDNS.addService("http", "tcp", 80);
+          isMDNSActive = true;
+        }
+        if (!isWebServerRunning) setup_web_server();
+        break;
+      case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+        Serial.println("WiFi: Disconnected");
+        wifiConnected = false;
+        break;
+      default: break;
+    }
+  });
+  
+  Serial.print("Connecting to Wi-Fi: ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+  wifiConnectStartTime = millis();
+  
+  // 6. Motor & AI Hardware
+  setup_motor_control();
+  setupSU03T(); // Initialize (Muted Mode)
+  
+  // 7. Memory & Audio Buffers
+  initPSRAM();
+  audio_recording = false;
+  audio_buffer = NULL;
+  audio_buffer_size = 0;
+  audioRecordingStartTime = 0;
+  rx_handle = NULL;
+  
+  // 8. Time Setup
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  
+  // Set default display
+  currentDisplayMode = AMBIENT_SENSORS;
+  voiceCommandDisplayEndTime = 0;
+  
+  Serial.println("Setup complete. Main loop starting.");
+}
+
+void loop() {
+  static unsigned long lastWatchdogReset = 0;
+  unsigned long currentMillis = millis();
+  
+  // 1. WATCHDOG (Keep ESP32 alive)
+  if (currentMillis - lastWatchdogReset >= 5000) {
+    // Serial.printf("Alive: %lu ms\n", currentMillis); // Optional debug
+    lastWatchdogReset = currentMillis;
+  }
+  
+  // 2. WIFI RECONNECTION
+  if (!wifiConnected && (currentMillis - wifiConnectStartTime > 10000)) {
+    Serial.println(TERM_YELLOW "Attempting to reconnect to WiFi..." TERM_RESET);
+    WiFi.reconnect();
+    wifiConnectStartTime = currentMillis;
+  }
+  
+  try {
+    // 3. HARDWARE CHECKS
+    processTactileSwitch();   // Check Mode Button
+    checkSu03tConnection();   // Drain SU-03T buffer (Muted)
+    process_max30102_data();  // Check Heart Sensor
+    
+    // 4. READ SENSORS (Interval Check)
+    if (currentMillis - lastSensorReadTime >= 
+       (aiModeEnabled ? AI_SENSOR_READ_INTERVAL : SENSOR_READ_INTERVAL)) {
+      if (ahtOperational) {
+        read_aht20();
+      }
+      lastSensorReadTime = currentMillis;
+    }
+    
+    // 5. READ DISTANCE
+    if (currentMillis - lastDistanceReadTime >= DISTANCE_READ_INTERVAL) {
+      distance_cm = getDistance();
+      lastDistanceReadTime = currentMillis;
+    }
+    
+    // 6. OBSTACLE & PATROL
+    checkObstacleAvoidance(); // Standard safety (Active when you drive manually)
+    runPatrolLogic();         // Patrol AI (Active when you tap the button)
+    
+    // 7. AI LOGIC
+    if (aiModeEnabled) {
+      
+      // Force display to AI mode if not showing a command
+      if (currentDisplayMode != AI_MODE_DISPLAY && currentDisplayMode != VOICE_COMMAND_DISPLAY) {
+        currentDisplayMode = AI_MODE_DISPLAY;
+        aiDisplayStatusUpdateNeeded = true;
+      }
+      
+      switch (currentAiState) {
+        // STATE: WAITING FOR USER
+        case AI_READY_FOR_VOICE_INPUT: {
+          // --- BOOT BUTTON TRIGGER ---
+          // GPIO 0 goes LOW when pressed
+          if (digitalRead(pin_BOOT_BTN) == LOW) {
+             Serial.println("BOOT BUTTON PRESSED: Starting Recording...");
+             delay(200); // Debounce
+             
+             // Initialize variables to start recording
+             audioRecordingStartTime = millis();
+             currentAiState = AI_RECORDING_AUDIO;
+          }
+          break;
+        }
+        
+        // STATE: RECORDING
+        case AI_RECORDING_AUDIO: {
+          // Init recording
+          if (audioRecordingStartTime > 0 && audio_buffer == NULL) {
+            Serial.println(TERM_CYAN "Initializing recording..." TERM_RESET);
+            // LED REMOVED HERE
+            
+            // I2S Check
+            if (rx_handle == NULL) {
+               if (!I2S_Record_Init()) {
+                 Serial.println(TERM_RED "Failed to initialize I2S" TERM_RESET);
+                 currentAiState = AI_READY_FOR_VOICE_INPUT;
+                 break;
+               }
+            }
+            
+            // Buffer Alloc
+            audio_buffer = (uint8_t*)ps_malloc(MAX_AUDIO_BUFFER_SIZE);
+            if (audio_buffer == NULL) {
+              Serial.println(TERM_RED "Failed to allocate audio buffer" TERM_RESET);
+              currentAiState = AI_READY_FOR_VOICE_INPUT;
+              break;
+            }
+            audio_buffer_size = 0;
+            audio_recording = true;
+            Serial.println(TERM_GREEN "Recording started" TERM_RESET);
+          }
+          
+          // Capture Audio
+          if (audio_recording) {
+            if (!Record_Continue()) {
+              Serial.println(TERM_YELLOW "Recording stopped due to error" TERM_RESET);
+              audio_recording = false;
+              // LED REMOVED HERE
+              audioRecordingStartTime = 0;
+              currentAiState = AI_UPLOADING_AUDIO;
+              break;
+            }
+            
+            // Time Limit Check (5 Seconds)
+            if (millis() - audioRecordingStartTime >= AI_RECORDING_DURATION_MS) {
+              Serial.println(TERM_CYAN "Recording finished (Time limit)" TERM_RESET);
+              audio_recording = false;
+              // LED REMOVED HERE
+              audioRecordingStartTime = 0;
+              currentAiState = AI_UPLOADING_AUDIO;
+            }
+          }
+          break;
+        }
+
+        // STATE: UPLOADING & TRANSCRIBING
+        case AI_UPLOADING_AUDIO: {
+          try {
+            Serial.println(TERM_CYAN "Transcribing with Groq..." TERM_RESET);
+            
+            if (audio_buffer == NULL || audio_buffer_size == 0) {
+              Serial.println(TERM_RED "No audio data recorded" TERM_RESET);
+              restartAICircle();
+              break;
+            }
+            
+            // Create WAV structure
+            size_t totalWavSize = 44 + audio_buffer_size;
+            uint8_t* wavBuffer = (uint8_t*)ps_malloc(totalWavSize);
+            
+            if (wavBuffer == NULL) {
+              Serial.println(TERM_RED "Failed to allocate WAV buffer" TERM_RESET);
+              restartAICircle();
+              break;
+            }
+            
+            createWAVHeader(wavBuffer, audio_buffer_size, SAMPLE_RATE, BITS_PER_SAMPLE, 1);
+            memcpy(wavBuffer + 44, audio_buffer, audio_buffer_size);
+            
+            // Send to Groq STT
+            String transcript = SpeechToText_Groq(wavBuffer, totalWavSize);
+            
+            free(wavBuffer);
+            // Reset buffer for next time
+            audio_buffer_size = 0;
+            
+            if (transcript.startsWith("ERROR") || transcript.length() == 0) {
+              Serial.println(TERM_RED "Transcription failed." TERM_RESET);
+              restartAICircle();
+            } else {
+              lastSttTranscript = transcript;
+              currentAiState = AI_THINKING;
+              Serial.printf(TERM_GREEN "You said: %s\n" TERM_RESET, transcript.c_str());
+            }
+          } catch (...) {
+            Serial.println(TERM_RED "Exception during transcription" TERM_RESET);
+            restartAICircle();
+          }
+          break;
+        }
+        
+        // STATE: AI GENERATION
+        case AI_THINKING: {
+          try {
+            lastAiResponse = getGeminiResponse(lastSttTranscript);
+            if (lastAiResponse != "ERROR") {
+              currentAiState = AI_GETTING_TTS;
+            } else {
+              restartAICircle();
+            }
+          } catch (...) {
+            Serial.println(TERM_RED "Exception during AI generation" TERM_RESET);
+            restartAICircle();
+          }
+          break;
+        }
+
+        // STATE: SPEAKING
+        case AI_GETTING_TTS: {
+           try {
+            Serial.println(TERM_CYAN "Speaking..." TERM_RESET);
+            currentAiState = AI_SPEAKING;
+            // LED REMOVED HERE
+            
+            Google_TTS(lastAiResponse);
+            
+            // Loop while speaking
+            while (audio_play.isRunning()) {
+              audio_play.loop();
+              // Emergency break with Boot Button
+              if (digitalRead(pin_BOOT_BTN) == LOW) {
+                audio_play.stopSong();
+                break;
+              }
+            }
+            
+            // LED REMOVED HERE
+            restartAICircle();
+          } catch (...) {
+            Serial.println(TERM_RED "Exception during TTS" TERM_RESET);
+            restartAICircle();
+          }
+          break;
+        }
+        
+        case AI_SPEAKING:
+        case AI_RESTARTING_CIRCLE:
+        case AI_IDLE:
+          // Fallthrough
+          break;
+      }
+    }
+    
+    // 8. UPDATE DISPLAY & TERMINAL
+    update_tft_display();
+    processTerminalInput();
+    
+  } catch (...) {
+    Serial.println(TERM_RED "CRITICAL ERROR: Main loop exception" TERM_RESET);
+    restartAICircle();
+  }
+  
+  yield(); // Let WiFi tasks run
+}
+
+// Add this at the very end of the file
+void led_RGB(int red, int green, int blue) {
+  // Intentionally empty. 
+  // This prevents crashes if the code tries to change LED colors.
+} 
